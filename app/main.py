@@ -8,12 +8,10 @@ from datetime import datetime
 from . import schemas
 from . import models
 
-
-Base.metadata.create_all(bind=engine)
-
 #  FastAPI
-app = FastAPI(title="УралWay API", version="1.0")
-
+# ВРЕМЕННО: Удаляем старую таблицу и создаем новую с правильными колонками
+models.Base.metadata.drop_all(bind=engine) 
+models.Base.metadata.create_all(bind=engine)
 
 app.add_middleware(
     CORSMiddleware,
