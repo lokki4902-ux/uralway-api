@@ -85,10 +85,28 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
 # ... (твои существующие импорты и маршруты) ...
 
 # 1. Получить все заявки
-@app.get("/api/bookings", response_model=list[schemas.BookingResponse])
+@app.get("/api/bookings")
 def get_bookings(db: Session = Depends(get_db)):
     bookings = db.query(models.Booking).order_by(models.Booking.id.desc()).all()
-    return bookings
+    result = []
+    for b in bookings:
+        user = db.query(models.User).filter(models.User.id == b.user_id).first()
+        route = db.query(models.Route).filter(models.Route.id == b.route_id).first()
+        result.append({
+            "id": b.id,
+            "phone": user.phone if user else "—",
+            "name": user.name if user else "—",
+            "email": user.email if user else "—",
+            "from_city": route.from_city if route else "—",
+            "to_city": route.to_city if route else "—",
+            "trip_date": str(b.trip_date),
+            "passengers": b.passengers,
+            "comment": b.comment,
+            "status": getattr(b, 'status', 'new'), 
+            "total_price": getattr(b, 'total_price', 0),
+            "total_km": getattr(b, 'total_km', 0)
+        })
+    return result
 
 # 2. Изменить статус заявки
 @app.patch("/api/bookings/{booking_id}")
