@@ -76,3 +76,37 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     db.refresh(new_booking)
 
     return {"message": "Бронирование создано!", "booking_id": new_booking.id}
+    
+    # main.py
+# ... (твои существующие импорты и маршруты) ...
+
+# 1. Получить все заявки
+@app.get("/api/bookings", response_model=list[schemas.BookingResponse])
+def get_bookings(db: Session = Depends(get_db)):
+    bookings = db.query(models.Booking).order_by(models.Booking.id.desc()).all()
+    return bookings
+
+# 2. Изменить статус заявки
+@app.patch("/api/bookings/{booking_id}")
+def update_booking_status(booking_id: int, status: str, db: Session = Depends(get_db)):
+    booking = db.query(models.Booking).filter(models.Booking.id == booking_id).first()
+    if booking:
+        booking.status = status
+        db.commit()
+        return {"message": "Status updated"}
+    return {"error": "Booking not found"}
+
+# 3. Удалить заявку
+@app.delete("/api/bookings/{booking_id}")
+def delete_booking(booking_id: int, db: Session = Depends(get_db)):
+    booking = db.query(models.Booking).filter(models.Booking.id == booking_id).first()
+    if booking:
+        db.delete(booking)
+        db.commit()
+        return {"message": "Booking deleted"}
+    return {"error": "Booking not found"}
+
+# 4. Получить всех подписчиков
+@app.get("/api/subscribers", response_model=list[schemas.SubscriberResponse])
+def get_subscribers(db: Session = Depends(get_db)):
+    return db.query(models.Subscriber).order_by(models.Subscriber.id.desc()).all()
