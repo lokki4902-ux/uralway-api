@@ -46,35 +46,40 @@ def subscribe(subscriber: SubscriberCreate, db: Session = Depends(get_db)):
 
 # Эндпоинт для бронирования поездки
 @app.post("/api/booking")
-def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
-    # 1. Находим или создаем пользователя
-    user = db.query(User).filter(User.phone == booking.phone).first()
+def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
+    # 1. Ищем или создаем пользователя
+    user = db.query(models.User).filter(models.User.phone == booking.phone).first()
     if not user:
-        user = User(phone=booking.phone, name=booking.name, email=booking.email)
+        user = models.User(phone=booking.phone, name=booking.name, email=booking.email)
         db.add(user)
         db.commit()
         db.refresh(user)
 
-       # 2. Находим маршрут или создаем новый, если его нет
-    route = db.query(Route).filter(
-        Route.from_city == booking.from_city,
-        Route.to_city == booking.to_city
+    # 2. Ищем или создаем маршрут
+    route = db.query(models.Route).filter(
+        models.Route.from_city == booking.from_city,
+        models.Route.to_city == booking.to_city
     ).first()
 
     if not route:
-        # Если маршрута нет, создаем его на лету
-        route = Route(from_city=booking.from_city, to_city=booking.to_city)
+        route = models.Route(from_city=booking.from_city, to_city=booking.to_city)
         db.add(route)
         db.commit()
         db.refresh(route)
 
     # 3. Создаем бронирование
-    new_booking = Booking(
+    new_booking = models.Booking(
         user_id=user.id,
         route_id=route.id,
         trip_date=booking.trip_date,
         passengers=booking.passengers,
-        comment=booking.comment
+        comment=booking.comment,
+        # Безопасно добавляем новые поля, если они пришли
+        trip_time=getattr(booking, 'trip_time', None),
+        trip_address=getattr(booking, 'trip_address', None),
+        status='new',
+        total_price=getattr(booking, 'total_price', 0),
+        total_km=getattr(booking, 'total_km', 0)
     )
     db.add(new_booking)
     db.commit()
