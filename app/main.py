@@ -54,14 +54,18 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
 
-    # 2. Находим маршрут
+       # 2. Находим маршрут или создаем новый, если его нет
     route = db.query(Route).filter(
         Route.from_city == booking.from_city,
         Route.to_city == booking.to_city
     ).first()
 
     if not route:
-        raise HTTPException(status_code=404, detail="Маршрут не найден")
+        # Если маршрута нет, создаем его на лету
+        route = Route(from_city=booking.from_city, to_city=booking.to_city)
+        db.add(route)
+        db.commit()
+        db.refresh(route)
 
     # 3. Создаем бронирование
     new_booking = Booking(
