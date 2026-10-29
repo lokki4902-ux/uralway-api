@@ -5,6 +5,7 @@ from app.database import engine, get_db, Base
 from app.models import Subscriber, User, Booking, Route
 from app.schemas import SubscriberCreate, SubscriberResponse, BookingCreate
 from datetime import datetime
+from . import schemas
 
 
 Base.metadata.create_all(bind=engine)
