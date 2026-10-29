@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # <-- НОВОЕ
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
 from app.models import Subscriber, User, Booking, Route
@@ -8,10 +8,12 @@ from datetime import datetime
 from . import schemas
 from . import models
 
-#  FastAPI
-# ВРЕМЕННО: Удаляем старую таблицу и создаем новую с правильными колонками
-models.Base.metadata.drop_all(bind=engine) 
-models.Base.metadata.create_all(bind=engine)
+# ВРЕМЕННО: Удаляем старую таблицу и создаем новую
+Base.metadata.drop_all(bind=engine)
+Base.metadata.create_all(bind=engine)
+
+# ВОТ ЭТУ СТРОКУ ТЫ СЛУЧАЙНО УДАЛИЛ - ЕЁ НУЖНО ВЕРНУТЬ:
+app = FastAPI(title="УралWay API", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +22,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # Тестовый эндпоинт
 @app.get("/")
