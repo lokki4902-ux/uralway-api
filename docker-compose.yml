@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Строка подключения к БД. Обратите внимание: хост — это имя сервиса db
+      - DATABASE_URL=postgresql+psycopg2://postgres:${POSTGRES_PASSWORD}@db:5432/uralway
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=uralway
+    volumes:
+      # Именованный том для сохранения данных между перезапусками
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
