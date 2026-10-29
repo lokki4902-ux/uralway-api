@@ -32,13 +32,13 @@ class Booking(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     route_id = Column(Integer, ForeignKey("routes.id"))
     trip_date = Column(Date)
-    trip_time = Column(String, nullable=True)      # <-- ДОБАВИТЬ
-    trip_address = Column(String, nullable=True)   # <-- ДОБАВИТЬ
+    trip_time = Column(String, nullable=True)      
+    trip_address = Column(String, nullable=True)   
     passengers = Column(Integer, default=1)
     comment = Column(String, nullable=True)
-    status = Column(String, default="new")         # <-- ДОБАВИТЬ
-    total_price = Column(Integer, default=0)       # <-- ДОБАВИТЬ
-    total_km = Column(Integer, default=0)          # <-- ДОБАВИТЬ
+    status = Column(String, default="new")         
+    total_price = Column(Integer, default=0)       
+    total_km = Column(Integer, default=0)                
 
 
 # Таблица подписчиков
