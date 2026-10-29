@@ -33,8 +33,12 @@ class BookingCreate(BaseModel):
     from_city: str
     to_city: str
     trip_date: date
+    trip_time: Optional[str] = None
+    trip_address: Optional[str] = None
     passengers: int = 1
     comment: Optional[str] = None
+    total_price: Optional[int] = 0
+    total_km: Optional[int] = 0
     
 # Схема для ОТВЕТА при получении заявки (для админки)
 class BookingResponse(BaseModel):
