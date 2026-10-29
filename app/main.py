@@ -9,7 +9,6 @@ from . import schemas
 from . import models
 
 # ВРЕМЕННО: Удаляем старую таблицу и создаем новую
-Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 # ВОТ ЭТУ СТРОКУ ТЫ СЛУЧАЙНО УДАЛИЛ - ЕЁ НУЖНО ВЕРНУТЬ:
