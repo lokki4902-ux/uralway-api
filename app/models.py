@@ -28,15 +28,17 @@ class Route(Base):
 # Таблица бронирований
 class Booking(Base):
     __tablename__ = "bookings"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     route_id = Column(Integer, ForeignKey("routes.id"))
-    trip_date = Column(Date, nullable=False)
+    trip_date = Column(Date)
+    trip_time = Column(String, nullable=True)      # <-- ДОБАВИТЬ
+    trip_address = Column(String, nullable=True)   # <-- ДОБАВИТЬ
     passengers = Column(Integer, default=1)
-    status = Column(String(20), default="new")
-    comment = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    comment = Column(String, nullable=True)
+    status = Column(String, default="new")         # <-- ДОБАВИТЬ
+    total_price = Column(Integer, default=0)       # <-- ДОБАВИТЬ
+    total_km = Column(Integer, default=0)          # <-- ДОБАВИТЬ
 
 
 # Таблица подписчиков
