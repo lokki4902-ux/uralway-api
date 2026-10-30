@@ -11,6 +11,7 @@ class User(Base):
     phone = Column(String(20), unique=True, nullable=False)
     name = Column(String(100))
     email = Column(String(100))
+    ban_reason = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     is_banned = Column(Boolean, default=False)
 
