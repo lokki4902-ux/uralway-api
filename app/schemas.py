@@ -56,6 +56,7 @@ class BookingResponse(BaseModel):
     total_price: Optional[int] = None
     total_km: Optional[int] = None
     created_at: datetime
+    is_banned: bool = False
 
     class Config:
         from_attributes = True
