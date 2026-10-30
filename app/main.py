@@ -146,11 +146,44 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
 def get_subscribers(db: Session = Depends(get_db)):
     return db.query(models.Subscriber).order_by(models.Subscriber.id.desc()).all()
 
+from pydantic import BaseModel
+
+# Схема для запроса бана (чтобы принимать причину)
+class BanRequest(BaseModel):
+    reason: str
+
+# 1. Обновленный эндпоинт бана (принимает причину)
 @app.post("/api/ban_user/{phone}")
-def ban_user(phone: str, db: Session = Depends(get_db)):
+def ban_user(phone: str, req: BanRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == phone).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     user.is_banned = True
+    user.ban_reason = req.reason
     db.commit()
     return {"message": f"Пользователь {phone} забанен"}
+
+# 2. Эндпоинт для разбана
+@app.post("/api/unban_user/{phone}")
+def unban_user(phone: str, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    user.is_banned = False
+    user.ban_reason = None
+    db.commit()
+    return {"message": f"Пользователь {phone} разбанен"}
+
+# 3. Получить список всех забаненных
+@app.get("/api/banned_users")
+def get_banned_users(db: Session = Depends(get_db)):
+    users = db.query(models.User).filter(models.User.is_banned == True).all()
+    return [{"id": u.id, "phone": u.phone, "name": u.name, "ban_reason": u.ban_reason} for u in users]
+
+# 4. Проверка на бан (для отзывов)
+@app.get("/api/check_ban/{phone}")
+def check_ban(phone: str, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.phone == phone).first()
+    if user and user.is_banned:
+        return {"is_banned": True}
+    return {"is_banned": False}
