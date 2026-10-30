@@ -46,6 +46,9 @@ def subscribe(subscriber: SubscriberCreate, db: Session = Depends(get_db)):
 # Эндпоинт для бронирования поездки
 @app.post("/api/booking")
 def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
+    # 1. Ищем пользователя (один раз)
+    user = db.query(models.User).filter(models.User.phone == booking.phone).first()
+    
      # ПРОВЕРКА НА БАН
     user = db.query(models.User).filter(models.User.phone == booking.phone).first()
     if user and user.is_banned:
