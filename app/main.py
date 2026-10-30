@@ -137,3 +137,12 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
 @app.get("/api/subscribers", response_model=list[schemas.SubscriberResponse])
 def get_subscribers(db: Session = Depends(get_db)):
     return db.query(models.Subscriber).order_by(models.Subscriber.id.desc()).all()
+
+@app.post("/api/ban_user/{phone}")
+def ban_user(phone: str, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    user.is_banned = True
+    db.commit()
+    return {"message": f"Пользователь {phone} забанен"}
