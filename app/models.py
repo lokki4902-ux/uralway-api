@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, DateTime, Date, Boolean, ForeignKey, Text, DECIMAL
 from sqlalchemy.sql import func
-from .database import Base  # <-- ИЗМЕНЕНО: добавлена точка
+from .database import Base  
 
 
 # Таблица пользователей
@@ -12,7 +12,7 @@ class User(Base):
     name = Column(String(100))
     email = Column(String(100))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
+    is_banned = Column(Boolean, default=False)
 
 # Таблица маршрутов
 class Route(Base):
