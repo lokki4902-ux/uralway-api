@@ -46,6 +46,11 @@ def subscribe(subscriber: SubscriberCreate, db: Session = Depends(get_db)):
 # Эндпоинт для бронирования поездки
 @app.post("/api/booking")
 def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
+     # ПРОВЕРКА НА БАН
+    user = db.query(models.User).filter(models.User.phone == booking.phone).first()
+    if user and user.is_banned:
+        raise HTTPException(status_code=403, detail="Пользователь забанен. Бронирование невозможно.")
+        
     # 1. Ищем или создаем пользователя
     user = db.query(models.User).filter(models.User.phone == booking.phone).first()
     if not user:
