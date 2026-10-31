@@ -6,7 +6,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Строка подключения к БД. Обратите внимание: хост — это имя сервиса db
+      # Строка подключения к БД
       - DATABASE_URL=postgresql+psycopg2://postgres:${POSTGRES_PASSWORD}@db:5432/uralway
     depends_on:
       - db
