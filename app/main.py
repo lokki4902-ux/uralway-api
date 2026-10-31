@@ -1,7 +1,6 @@
 import os
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
-import smtplib
-from email.message import EmailMessage
+import resend
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -17,10 +16,8 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="УралWay API", version="1.0")
 
-SMTP_SERVER = "smtp.yandex.ru"
-SMTP_PORT = 465
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") 
+# --- НАСТРОЙКИ ПОЧТЫ (RESEND) ---
+resend.api_key = os.getenv("RESEND_API_KEY")
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,14 +195,28 @@ class AnnouncementEmail(BaseModel):
     time: str
     address: str
 
-# Функция для отправки писем (работает в фоне)
+# --- ФУНКЦИЯ ОТПРАВКИ ПИСЕМ ЧЕРЕЗ RESEND ---
 def send_email_to_subscribers(subject: str, body: str, db: Session):
     subscribers = db.query(models.Subscriber).all()
     emails = [sub.email for sub in subscribers]
-    
+
     if not emails:
         print("Нет подписчиков для рассылки.")
         return
+
+    try:
+        # Resend позволяет отправлять до 50 адресов в одном запросе
+        for email in emails:
+            params = {
+                "from": "UralWay <onboarding@resend.dev>", # Временный адрес отправителя
+                "to": [email],
+                "subject": subject,
+                "text": body, # Используем простой текст
+            }
+            resend.Emails.send(params)
+        print(f"Успешно отправлено {len(emails)} писем через Resend.")
+    except Exception as e:
+        print(f"Ошибка отправки через Resend: {e}")
 
     # Отправляем письма скрытой копией (BCC), чтобы подписчики не видели почты друг друга
     msg = EmailMessage()
