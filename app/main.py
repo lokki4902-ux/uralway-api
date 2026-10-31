@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+import smtplib
+from email.message import EmailMessage
+from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
@@ -14,6 +17,12 @@ Base.metadata.create_all(bind=engine)
 
 # ВОТ ЭТУ СТРОКУ ТЫ СЛУЧАЙНО УДАЛИЛ - ЕЁ НУЖНО ВЕРНУТЬ:
 app = FastAPI(title="УралWay API", version="1.0")
+
+# НАСТРОЙКИ ПОЧТЫ
+SMTP_SERVER = "smtp.yandex.ru"
+SMTP_PORT = 465
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") 
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,3 +197,58 @@ def check_ban(phone: str, db: Session = Depends(get_db)):
     if user and user.is_banned:
         return {"is_banned": True}
     return {"is_banned": False}
+
+# Схема для принятия данных о новом рейсе
+class AnnouncementEmail(BaseModel):
+    date: str
+    time: str
+    address: str
+
+# Функция для отправки писем (работает в фоне)
+def send_email_to_subscribers(subject: str, body: str, db: Session):
+    subscribers = db.query(models.Subscriber).all()
+    emails = [sub.email for sub in subscribers]
+    
+    if not emails:
+        print("Нет подписчиков для рассылки.")
+        return
+
+    # Отправляем письма скрытой копией (BCC), чтобы подписчики не видели почты друг друга
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = SMTP_USER
+    msg['To'] = SMTP_USER # Техническое поле, письма уйдут по BCC
+    msg['Bcc'] = ", ".join(emails)
+    
+    # Красивое текстовое тело письма
+    msg.set_content(body)
+
+    try:
+        # Подключаемся к серверу Яндекса по защищенному протоколу
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        print(f"Успешно отправлено {len(emails)} писем.")
+    except Exception as e:
+        print(f"Ошибка отправки письма: {e}")
+
+# Эндпоинт, который вызывает админка при создании рейса
+@app.post("/api/notify_subscribers")
+def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    subject = "УралWay: Новый рейс!"
+    body = f"""
+    Здравствуйте!
+    
+    Опубликован новый рейс:
+    Дата: {ann.date}
+    Время: {ann.time}
+    Адрес отправления: {ann.address}
+    
+    Забронируйте места на нашем сайте!
+    
+    Если есть вопросы - свяжитесь с нами: +7 (909) 092-09-89
+    """
+    
+    # Добавляем задачу в фон, чтобы сервер не зависал на 10 секунд, пока отправляются письма
+    background_tasks.add_task(send_email_to_subscribers, subject, body, db)
+    return {"message": "Рассылка запущена в фоне"}
