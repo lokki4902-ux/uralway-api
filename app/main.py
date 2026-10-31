@@ -12,14 +12,11 @@ from datetime import datetime
 from . import schemas
 from . import models
 
-# ВРЕМЕННО: Удаляем старую таблицу и создаем новую
 # Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
-# ВОТ ЭТУ СТРОКУ ТЫ СЛУЧАЙНО УДАЛИЛ - ЕЁ НУЖНО ВЕРНУТЬ:
 app = FastAPI(title="УралWay API", version="1.0")
 
-# НАСТРОЙКИ ПОЧТЫ
 SMTP_SERVER = "smtp.yandex.ru"
 SMTP_PORT = 465
 SMTP_USER = os.getenv("SMTP_USER")
@@ -33,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Тестовый эндпоинт
 @app.get("/")
 def read_root():
     return {"message": "УралWay API работает!", "timestamp": datetime.now()}
@@ -104,9 +100,6 @@ def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)
     db.refresh(new_booking)
 
     return {"message": "Бронирование создано!", "booking_id": new_booking.id}
-    
-    # main.py
-# ... (твои существующие импорты и маршруты) ...
 
 # 1. Получить все заявки
 @app.get("/api/bookings")
