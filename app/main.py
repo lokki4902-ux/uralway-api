@@ -11,13 +11,11 @@ from datetime import datetime
 from . import schemas
 from . import models
 
-# ВНИМАНИЕ: drop_all закомментирован, чтобы база не удалялась при каждом перезапуске!
 # Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="УралWay API", version="1.0")
 
-# --- НАСТРОЙКИ ПОЧТЫ (RESEND) ---
 resend.api_key = os.getenv("RESEND_API_KEY")
 
 app.add_middleware(
@@ -28,7 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- МОДЕЛИ ДЛЯ ЗАПРОСОВ ---
 class BanRequest(BaseModel):
     reason: str
 
@@ -36,9 +33,6 @@ class AnnouncementEmail(BaseModel):
     date: str
     time: str
     address: str
-
-
-# --- ЭНДПОИНТЫ ---
 
 @app.get("/")
 def read_root():
@@ -58,21 +52,17 @@ def subscribe(subscriber: SubscriberCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/booking")
 def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
-    # 1. Ищем пользователя (один раз)
     user = db.query(models.User).filter(models.User.phone == booking.phone).first()
 
-    # 2. Проверка на бан
     if user and user.is_banned:
         raise HTTPException(status_code=403, detail="Пользователь забанен. Бронирование невозможно.")
-
-    # 3. Если пользователя нет — создаем
+        
     if not user:
         user = models.User(phone=booking.phone, name=booking.name, email=booking.email)
         db.add(user)
         db.commit()
         db.refresh(user)
 
-    # 4. Ищем или создаем маршрут
     route = db.query(models.Route).filter(
         models.Route.from_city == booking.from_city,
         models.Route.to_city == booking.to_city
@@ -84,7 +74,6 @@ def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)
         db.commit()
         db.refresh(route)
 
-    # 5. Создаем бронирование
     new_booking = models.Booking(
         user_id=user.id,
         route_id=route.id,
@@ -192,9 +181,6 @@ def check_ban(phone: str, db: Session = Depends(get_db)):
     if user and user.is_banned:
         return {"is_banned": True}
     return {"is_banned": False}
-
-
-# --- ЛОГИКА РАССЫЛКИ ПИСЕМ (RESEND) ---
 
 def send_email_to_subscribers(subject: str, body: str, db: Session):
     subscribers = db.query(models.Subscriber).all()
