@@ -120,7 +120,7 @@ POST /api/unban_user/{phone} — разбан.
 
 GET /api/banned_users — список забаненных.
 
- 6. Панель администратора (admin.html)
+6. Панель администратора (admin.html)
 Доступна по адресу: https://golden-zuccutto-687bfd.netlify.app/admin.html
 
 Пароль: admin123 (хранится в script.js).
