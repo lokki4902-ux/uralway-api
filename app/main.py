@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 import smtplib
 from email.message import EmailMessage
