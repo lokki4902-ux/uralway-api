@@ -1,6 +1,6 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, List
 
 
 # Схема для создания подписчика
@@ -25,6 +25,13 @@ class UserCreate(BaseModel):
     email: Optional[EmailStr] = None
 
 
+# Один участок заявки: откуда, куда, сколько мест
+class BookingSegmentIn(BaseModel):
+    from_city: str
+    to_city: str
+    seats: int = Field(ge=1, le=8)
+
+
 # Схема для создания бронирования
 class BookingCreate(BaseModel):
     phone: str
@@ -39,7 +46,9 @@ class BookingCreate(BaseModel):
     comment: Optional[str] = None
     total_price: Optional[int] = 0
     total_km: Optional[int] = 0
-    
+    # Новое: список участков (строки формы). Если не передан — берутся from_city/to_city/passengers
+    segments: Optional[List[BookingSegmentIn]] = None
+
 # Схема для ОТВЕТА при получении заявки (для админки)
 class BookingResponse(BaseModel):
     id: int
