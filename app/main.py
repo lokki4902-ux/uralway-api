@@ -14,7 +14,7 @@ from typing import List, Tuple, Optional
 from . import schemas
 from . import models
 
-# Base.metadata.drop_all(bind=engine)
+Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="УралWay API", version="1.0")
