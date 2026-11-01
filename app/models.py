@@ -35,6 +35,9 @@ class Booking(Base):
     trip_date = Column(Date)
     trip_time = Column(String, nullable=True)
     trip_address = Column(String, nullable=True)
+    trip_direction = Column(String, nullable=True, default="forward")  # 'forward' | 'return'
+    boarding_time = Column(String, nullable=True)      # время посадки пассажира
+    boarding_address = Column(String, nullable=True)   # адрес посадки пассажира
     passengers = Column(Integer, default=1)
     comment = Column(String, nullable=True)
     status = Column(String, default="new")
