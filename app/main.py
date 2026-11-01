@@ -4,12 +4,13 @@ from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 import resend
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
 from app.models import Subscriber, User, Booking, Route, BookingSegment
 from app.schemas import SubscriberCreate, SubscriberResponse, BookingCreate
 from datetime import datetime, date as date_type
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from . import schemas
 from . import models
 
@@ -35,6 +36,10 @@ class AnnouncementEmail(BaseModel):
     date: str
     time: str
     address: str
+    # Необязательно: обратный рейс того же цикла
+    return_date: Optional[str] = None
+    return_time: Optional[str] = None
+    return_address: Optional[str] = None
 
 @app.get("/")
 def read_root():
@@ -98,12 +103,19 @@ def segment_indices(from_city: str, to_city: str) -> List[int]:
     return list(range(lo, hi))
 
 
-def get_occupancy(trip_date, trip_time, db: Session) -> List[int]:
-    """Сколько мест занято на каждом участке рейса. Отменённые заявки места освобождают."""
+def get_occupancy(trip_date, trip_time, db: Session, direction: str = "forward") -> List[int]:
+    """Сколько мест занято на каждом участке рейса. Отменённые заявки места освобождают.
+    Рейс = дата + время + направление: «туда» и «обратно» считаются независимо."""
     occupied = [0] * len(SEGMENT_KEYS)
+    if direction == "forward":
+        # старые заявки без направления относятся к прямому рейсу
+        direction_cond = or_(models.Booking.trip_direction == "forward", models.Booking.trip_direction.is_(None))
+    else:
+        direction_cond = models.Booking.trip_direction == direction
     bookings = db.query(models.Booking).filter(
         models.Booking.trip_date == trip_date,
         models.Booking.trip_time == normalize_time(trip_time),
+        direction_cond,
     ).all()
     bookings = [b for b in bookings if (b.status or "new") != "cancelled"]
     if not bookings:
@@ -130,9 +142,9 @@ def get_occupancy(trip_date, trip_time, db: Session) -> List[int]:
     return occupied
 
 
-def check_segments_availability(trip_date, trip_time, requests: List[Tuple[str, str, int]], db: Session) -> bool:
+def check_segments_availability(trip_date, trip_time, requests: List[Tuple[str, str, int]], db: Session, direction: str = "forward") -> bool:
     """Проверка сразу всех строк заявки: если строки пересекаются по участкам, места суммируются."""
-    occupied = get_occupancy(trip_date, trip_time, db)
+    occupied = get_occupancy(trip_date, trip_time, db, direction)
     extra = [0] * len(SEGMENT_KEYS)
     for from_city, to_city, seats in requests:
         for i in segment_indices(from_city, to_city):
@@ -140,21 +152,85 @@ def check_segments_availability(trip_date, trip_time, requests: List[Tuple[str, 
     return all(occupied[i] + extra[i] <= TOTAL_SEATS for i in range(len(SEGMENT_KEYS)))
 
 
-def check_seat_availability(announcement_date, announcement_time, from_city, to_city, requested_seats, db) -> bool:
+def check_seat_availability(announcement_date, announcement_time, from_city, to_city, requested_seats, db, direction: str = "forward") -> bool:
     """True — если на КАЖДОМ участке от from_city до to_city свободно не меньше requested_seats."""
     return check_segments_availability(
-        announcement_date, announcement_time, [(from_city, to_city, requested_seats)], db
+        announcement_date, announcement_time, [(from_city, to_city, requested_seats)], db, direction
     )
+
+
+# =====================================================================
+# СПРАВОЧНИК ВРЕМЕНИ И АДРЕСОВ ПОСАДКИ  (МЕНЯТЬ ТОЛЬКО ЗДЕСЬ)
+# =====================================================================
+# ⚠️ ВСЕ ДАННЫЕ НИЖЕ — ПРИМЕРНЫЕ (условные). Когда водитель даст точные адреса и время,
+# достаточно поправить этот словарь: сайт получает его через GET /api/boarding-info,
+# а сервер использует его при сохранении заявки. Больше нигде ничего менять не нужно.
+#
+#   "forward" — прямое направление  (Магнитогорск ➔ Оренбург)
+#   "return"  — обратное направление (Оренбург ➔ Магнитогорск)
+CITY_BOARDING_INFO = {
+    "forward": {
+        "Магнитогорск": {"time": "07:30", "address": "Гостиный двор"},
+        "Сибай":        {"time": "08:30", "address": "ТЦ Аркаим"},
+        "Баймак":       {"time": "09:10", "address": "Автовокзал"},
+        "Юлдыбаево":    {"time": "09:50", "address": "Центральная площадь"},
+        "Зилаир":       {"time": "10:30", "address": "Автостанция"},
+        "Исянгулово":   {"time": "11:00", "address": "ТЦ"},
+        "Саракташ":     {"time": "11:50", "address": "Автовокзал"},
+        "Оренбург":     {"time": "12:30", "address": "Автовокзал"},
+    },
+    "return": {
+        "Оренбург":     {"time": "14:00", "address": "Автовокзал"},
+        "Саракташ":     {"time": "14:40", "address": "Автовокзал"},
+        "Исянгулово":   {"time": "15:30", "address": "ТЦ"},
+        "Зилаир":       {"time": "16:00", "address": "Автостанция"},
+        "Юлдыбаево":    {"time": "16:40", "address": "Центральная площадь"},
+        "Баймак":       {"time": "17:20", "address": "Автовокзал"},
+        "Сибай":        {"time": "18:00", "address": "ТЦ Аркаим"},
+        "Магнитогорск": {"time": "19:00", "address": "Гостиный двор"},
+    },
+}
+DIRECTIONS = ("forward", "return")
+DIRECTION_MISMATCH_MESSAGE = "Выбранный участок не соответствует направлению рейса"
+
+
+def get_boarding_info(direction: str, city: str):
+    """{'time': ..., 'address': ...} или None, если для города нет данных (например, Кугарчи)."""
+    return CITY_BOARDING_INFO.get(direction, {}).get(city)
+
+
+def segments_match_direction(segments, direction: str) -> bool:
+    """Прямой рейс идёт по возрастанию CITIES_ORDER, обратный — по убыванию.
+    Города вне CITIES_ORDER не проверяются."""
+    for from_city, to_city, _seats in segments:
+        a, b = CITY_INDEX.get(from_city), CITY_INDEX.get(to_city)
+        if a is None or b is None:
+            continue
+        if direction == "forward" and a > b:
+            return False
+        if direction == "return" and a < b:
+            return False
+    return True
+
+
+@app.get("/api/boarding-info")
+def boarding_info():
+    """Справочник времени/адресов посадки для сайта."""
+    return CITY_BOARDING_INFO
 
 
 @app.get("/api/availability")
 def get_availability(
     trip_date: date_type = Query(..., alias="date"),
     trip_time: str = Query(..., alias="time"),
+    direction: str = Query("forward"),
     db: Session = Depends(get_db),
 ):
-    """Карта занятости рейса: {"Магнитогорск-Сибай": 8, "Сибай-Баймак": 5, ...} (занятые места)."""
-    occupied = get_occupancy(trip_date, trip_time, db)
+    """Карта занятости рейса: {"Магнитогорск-Сибай": 8, "Сибай-Баймак": 5, ...} (занятые места).
+    direction: forward (туда) или return (обратно) — у каждого направления своя шкала."""
+    if direction not in DIRECTIONS:
+        raise HTTPException(status_code=400, detail="direction должен быть forward или return")
+    occupied = get_occupancy(trip_date, trip_time, db, direction)
     return {SEGMENT_KEYS[i]: occupied[i] for i in range(len(SEGMENT_KEYS))}
 
 
@@ -175,11 +251,24 @@ def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)
         if from_city == to_city:
             raise HTTPException(status_code=400, detail="Пункты отправления и назначения совпадают")
 
+    direction = booking.trip_direction or "forward"
+    if not segments_match_direction(segments, direction):
+        raise HTTPException(status_code=400, detail=DIRECTION_MISMATCH_MESSAGE)
+
     total_passengers = sum(seats for _f, _t, seats in segments)
     trip_time = normalize_time(getattr(booking, 'trip_time', None))
 
+    # Посадка: берём то, что прислал сайт; если не прислал — подставляем из справочника
+    boarding_time = booking.boarding_time
+    boarding_address = booking.boarding_address
+    if not boarding_time or not boarding_address:
+        info = get_boarding_info(direction, segments[0][0])
+        if info:
+            boarding_time = boarding_time or info["time"]
+            boarding_address = boarding_address or info["address"]
+
     with _booking_lock:
-        if not check_segments_availability(booking.trip_date, trip_time, segments, db):
+        if not check_segments_availability(booking.trip_date, trip_time, segments, db, direction):
             raise HTTPException(status_code=400, detail=NO_SEATS_MESSAGE)
 
         if not user:
@@ -207,6 +296,9 @@ def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)
             comment=booking.comment,
             trip_time=trip_time,
             trip_address=getattr(booking, 'trip_address', None),
+            trip_direction=direction,
+            boarding_time=boarding_time,
+            boarding_address=boarding_address,
             status='new',
             total_price=getattr(booking, 'total_price', 0),
             total_km=getattr(booking, 'total_km', 0)
@@ -240,6 +332,9 @@ def get_bookings(db: Session = Depends(get_db)):
             "to_city": route.to_city if route else "—",
             "trip_date": str(b.trip_date),
             "trip_time": getattr(b, 'trip_time', '—'),
+            "trip_direction": getattr(b, 'trip_direction', None) or "forward",
+            "boarding_time": getattr(b, 'boarding_time', None),
+            "boarding_address": getattr(b, 'boarding_address', None),
             "passengers": b.passengers,
             "comment": b.comment,
             "status": getattr(b, 'status', 'new'),
@@ -339,6 +434,14 @@ def send_email_to_subscribers(subject: str, body: str, db: Session):
 @app.post("/api/notify_subscribers")
 def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     subject = "УралWay: Новый рейс!"
+    return_block = ""
+    if ann.return_date and ann.return_time:
+        return_block = f"""
+Обратный рейс (Оренбург ➔ Магнитогорск):
+Дата: {ann.return_date}
+Время: {ann.return_time}
+Адрес отправления: {ann.return_address or '—'}
+"""
     body = f"""
 Здравствуйте!
 
@@ -346,7 +449,7 @@ def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks
 Дата: {ann.date}
 Время: {ann.time}
 Адрес отправления: {ann.address}
-
+{return_block}
 Забронируйте места на нашем сайте!
 
 Если есть вопросы - свяжитесь с нами: +7 (909) 092-09-89
