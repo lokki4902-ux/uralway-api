@@ -1,6 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 
 # Схема для создания подписчика
@@ -42,6 +42,9 @@ class BookingCreate(BaseModel):
     trip_date: date
     trip_time: Optional[str] = None
     trip_address: Optional[str] = None
+    trip_direction: Optional[Literal["forward", "return"]] = "forward"
+    boarding_time: Optional[str] = None
+    boarding_address: Optional[str] = None
     passengers: int = 1
     comment: Optional[str] = None
     total_price: Optional[int] = 0
