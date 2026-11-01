@@ -39,7 +39,19 @@ class Booking(Base):
     comment = Column(String, nullable=True)
     status = Column(String, default="new")
     total_price = Column(Integer, default=0) 
-    total_km = Column(Integer, default=0)            
+    total_km = Column(Integer, default=0)
+
+
+# Участки маршрута внутри заявки: одна строка формы = один сегмент
+# (откуда, куда, сколько мест). По ним считается занятость по участкам.
+class BookingSegment(Base):
+    __tablename__ = "booking_segments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False, index=True)
+    from_city = Column(String(100), nullable=False)
+    to_city = Column(String(100), nullable=False)
+    seats = Column(Integer, nullable=False, default=1)
 
 
 # Таблица подписчиков
