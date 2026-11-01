@@ -1,13 +1,15 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+import threading
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 import resend
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
-from app.models import Subscriber, User, Booking, Route
+from app.models import Subscriber, User, Booking, Route, BookingSegment
 from app.schemas import SubscriberCreate, SubscriberResponse, BookingCreate
-from datetime import datetime
+from datetime import datetime, date as date_type
+from typing import List, Tuple
 from . import schemas
 from . import models
 
@@ -50,45 +52,175 @@ def subscribe(subscriber: SubscriberCreate, db: Session = Depends(get_db)):
     db.refresh(new_subscriber)
     return new_subscriber
 
+# =====================================================================
+# СЕГМЕНТНОЕ БРОНИРОВАНИЕ
+# =====================================================================
+
+# Города маршрута СТРОГО по порядку. Участок i — это отрезок между
+# CITIES_ORDER[i] и CITIES_ORDER[i + 1].
+CITIES_ORDER = [
+    "Магнитогорск",
+    "Сибай",
+    "Баймак",
+    "Юлдыбаево",
+    "Зилаир",
+    "Исянгулово",
+    "Саракташ",
+    "Оренбург",
+]
+CITY_INDEX = {city: i for i, city in enumerate(CITIES_ORDER)}
+SEGMENT_KEYS = [f"{CITIES_ORDER[i]}-{CITIES_ORDER[i + 1]}" for i in range(len(CITIES_ORDER) - 1)]
+TOTAL_SEATS = 8
+NO_SEATS_MESSAGE = "На выбранном участке маршрута недостаточно свободных мест"
+
+# Защита от гонки «проверил — записал» внутри одного процесса.
+# При нескольких воркерах uvicorn/gunicorn нужна блокировка на уровне БД.
+_booking_lock = threading.Lock()
+
+
+def normalize_time(value):
+    """'08:00:00' -> '08:00', чтобы время рейса совпадало независимо от формата."""
+    if not value:
+        return None
+    return str(value).strip()[:5]
+
+
+def segment_indices(from_city: str, to_city: str) -> List[int]:
+    """Номера участков, которые проезжает пассажир (направление не важно).
+    Город вне CITIES_ORDER (Кугарчи, Аманат, Тазларово) консервативно считается
+    занимающим ВЕСЬ маршрут, чтобы не допустить овербукинг."""
+    a, b = CITY_INDEX.get(from_city), CITY_INDEX.get(to_city)
+    if a is None or b is None:
+        return list(range(len(SEGMENT_KEYS)))
+    if a == b:
+        return []
+    lo, hi = sorted((a, b))
+    return list(range(lo, hi))
+
+
+def get_occupancy(trip_date, trip_time, db: Session) -> List[int]:
+    """Сколько мест занято на каждом участке рейса. Отменённые заявки места освобождают."""
+    occupied = [0] * len(SEGMENT_KEYS)
+    bookings = db.query(models.Booking).filter(
+        models.Booking.trip_date == trip_date,
+        models.Booking.trip_time == normalize_time(trip_time),
+    ).all()
+    bookings = [b for b in bookings if (b.status or "new") != "cancelled"]
+    if not bookings:
+        return occupied
+
+    seg_rows = db.query(models.BookingSegment).filter(
+        models.BookingSegment.booking_id.in_([b.id for b in bookings])
+    ).all()
+    by_booking = {}
+    for s in seg_rows:
+        by_booking.setdefault(s.booking_id, []).append(s)
+
+    for b in bookings:
+        segs = by_booking.get(b.id)
+        if segs:
+            items = [(s.from_city, s.to_city, s.seats) for s in segs]
+        else:
+            # Старые заявки без сегментов: один маршрут на всех пассажиров
+            route = db.query(models.Route).filter(models.Route.id == b.route_id).first()
+            items = [(route.from_city, route.to_city, b.passengers or 1)] if route else []
+        for from_city, to_city, seats in items:
+            for i in segment_indices(from_city, to_city):
+                occupied[i] += seats
+    return occupied
+
+
+def check_segments_availability(trip_date, trip_time, requests: List[Tuple[str, str, int]], db: Session) -> bool:
+    """Проверка сразу всех строк заявки: если строки пересекаются по участкам, места суммируются."""
+    occupied = get_occupancy(trip_date, trip_time, db)
+    extra = [0] * len(SEGMENT_KEYS)
+    for from_city, to_city, seats in requests:
+        for i in segment_indices(from_city, to_city):
+            extra[i] += seats
+    return all(occupied[i] + extra[i] <= TOTAL_SEATS for i in range(len(SEGMENT_KEYS)))
+
+
+def check_seat_availability(announcement_date, announcement_time, from_city, to_city, requested_seats, db) -> bool:
+    """True — если на КАЖДОМ участке от from_city до to_city свободно не меньше requested_seats."""
+    return check_segments_availability(
+        announcement_date, announcement_time, [(from_city, to_city, requested_seats)], db
+    )
+
+
+@app.get("/api/availability")
+def get_availability(
+    trip_date: date_type = Query(..., alias="date"),
+    trip_time: str = Query(..., alias="time"),
+    db: Session = Depends(get_db),
+):
+    """Карта занятости рейса: {"Магнитогорск-Сибай": 8, "Сибай-Баймак": 5, ...} (занятые места)."""
+    occupied = get_occupancy(trip_date, trip_time, db)
+    return {SEGMENT_KEYS[i]: occupied[i] for i in range(len(SEGMENT_KEYS))}
+
+
 @app.post("/api/booking")
 def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == booking.phone).first()
 
     if user and user.is_banned:
         raise HTTPException(status_code=403, detail="Пользователь забанен. Бронирование невозможно.")
-        
-    if not user:
-        user = models.User(phone=booking.phone, name=booking.name, email=booking.email)
-        db.add(user)
+
+    # Участки заявки: из segments, либо (старые клиенты) из from_city/to_city/passengers
+    if booking.segments:
+        segments = [(s.from_city, s.to_city, s.seats) for s in booking.segments]
+    else:
+        segments = [(booking.from_city, booking.to_city, booking.passengers)]
+
+    for from_city, to_city, _seats in segments:
+        if from_city == to_city:
+            raise HTTPException(status_code=400, detail="Пункты отправления и назначения совпадают")
+
+    total_passengers = sum(seats for _f, _t, seats in segments)
+    trip_time = normalize_time(getattr(booking, 'trip_time', None))
+
+    with _booking_lock:
+        if not check_segments_availability(booking.trip_date, trip_time, segments, db):
+            raise HTTPException(status_code=400, detail=NO_SEATS_MESSAGE)
+
+        if not user:
+            user = models.User(phone=booking.phone, name=booking.name, email=booking.email)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        route = db.query(models.Route).filter(
+            models.Route.from_city == booking.from_city,
+            models.Route.to_city == booking.to_city
+        ).first()
+
+        if not route:
+            route = models.Route(from_city=booking.from_city, to_city=booking.to_city)
+            db.add(route)
+            db.commit()
+            db.refresh(route)
+
+        new_booking = models.Booking(
+            user_id=user.id,
+            route_id=route.id,
+            trip_date=booking.trip_date,
+            passengers=total_passengers,
+            comment=booking.comment,
+            trip_time=trip_time,
+            trip_address=getattr(booking, 'trip_address', None),
+            status='new',
+            total_price=getattr(booking, 'total_price', 0),
+            total_km=getattr(booking, 'total_km', 0)
+        )
+        db.add(new_booking)
+        db.flush()  # получаем new_booking.id
+
+        for from_city, to_city, seats in segments:
+            db.add(models.BookingSegment(
+                booking_id=new_booking.id, from_city=from_city, to_city=to_city, seats=seats
+            ))
         db.commit()
-        db.refresh(user)
+        db.refresh(new_booking)
 
-    route = db.query(models.Route).filter(
-        models.Route.from_city == booking.from_city,
-        models.Route.to_city == booking.to_city
-    ).first()
-
-    if not route:
-        route = models.Route(from_city=booking.from_city, to_city=booking.to_city)
-        db.add(route)
-        db.commit()
-        db.refresh(route)
-
-    new_booking = models.Booking(
-        user_id=user.id,
-        route_id=route.id,
-        trip_date=booking.trip_date,
-        passengers=booking.passengers,
-        comment=booking.comment,
-        trip_time=getattr(booking, 'trip_time', None),
-        trip_address=getattr(booking, 'trip_address', None),
-        status='new',
-        total_price=getattr(booking, 'total_price', 0),
-        total_km=getattr(booking, 'total_km', 0)
-    )
-    db.add(new_booking)
-    db.commit()
-    db.refresh(new_booking)
     return {"message": "Бронирование создано!", "booking_id": new_booking.id}
 
 
@@ -133,6 +265,7 @@ def update_booking_status(booking_id: int, status: str, db: Session = Depends(ge
 def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     booking = db.query(models.Booking).filter(models.Booking.id == booking_id).first()
     if booking:
+        db.query(models.BookingSegment).filter(models.BookingSegment.booking_id == booking_id).delete()
         db.delete(booking)
         db.commit()
         return {"message": "Booking deleted"}
