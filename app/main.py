@@ -19,6 +19,9 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="УралWay API", version="1.0")
 
+# Телефоны администраторов (для писем подписчикам)
+ADMIN_PHONES = ["+7 (919) 400-64-14", "+7 (919) 325-15-39"]
+
 resend.api_key = os.getenv("RESEND_API_KEY")
 
 app.add_middleware(
@@ -160,43 +163,13 @@ def check_seat_availability(announcement_date, announcement_time, from_city, to_
 
 
 # =====================================================================
-# СПРАВОЧНИК ВРЕМЕНИ И АДРЕСОВ ПОСАДКИ  (МЕНЯТЬ ТОЛЬКО ЗДЕСЬ)
+# НАПРАВЛЕНИЯ РЕЙСА
 # =====================================================================
-# ⚠️ ВСЕ ДАННЫЕ НИЖЕ — ПРИМЕРНЫЕ (условные). Когда водитель даст точные адреса и время,
-# достаточно поправить этот словарь: сайт получает его через GET /api/boarding-info,
-# а сервер использует его при сохранении заявки. Больше нигде ничего менять не нужно.
-#
-#   "forward" — прямое направление  (Магнитогорск ➔ Оренбург)
-#   "return"  — обратное направление (Оренбург ➔ Магнитогорск)
-CITY_BOARDING_INFO = {
-    "forward": {
-        "Магнитогорск": {"time": "07:30", "address": "Гостиный двор"},
-        "Сибай":        {"time": "08:30", "address": "ТЦ Аркаим"},
-        "Баймак":       {"time": "09:10", "address": "Автовокзал"},
-        "Юлдыбаево":    {"time": "09:50", "address": "Центральная площадь"},
-        "Зилаир":       {"time": "10:30", "address": "Автостанция"},
-        "Исянгулово":   {"time": "11:00", "address": "ТЦ"},
-        "Саракташ":     {"time": "11:50", "address": "Автовокзал"},
-        "Оренбург":     {"time": "12:30", "address": "Автовокзал"},
-    },
-    "return": {
-        "Оренбург":     {"time": "14:00", "address": "Автовокзал"},
-        "Саракташ":     {"time": "14:40", "address": "Автовокзал"},
-        "Исянгулово":   {"time": "15:30", "address": "ТЦ"},
-        "Зилаир":       {"time": "16:00", "address": "Автостанция"},
-        "Юлдыбаево":    {"time": "16:40", "address": "Центральная площадь"},
-        "Баймак":       {"time": "17:20", "address": "Автовокзал"},
-        "Сибай":        {"time": "18:00", "address": "ТЦ Аркаим"},
-        "Магнитогорск": {"time": "19:00", "address": "Гостиный двор"},
-    },
-}
+# Адреса и время посадки выбирает сам пассажир на сайте (CITY_STOPS в script.js)
+# и присылает в полях boarding_time / boarding_address — сервер их просто сохраняет.
+#   "forward" — Магнитогорск ➔ Оренбург, "return" — Оренбург ➔ Магнитогорск
 DIRECTIONS = ("forward", "return")
 DIRECTION_MISMATCH_MESSAGE = "Выбранный участок не соответствует направлению рейса"
-
-
-def get_boarding_info(direction: str, city: str):
-    """{'time': ..., 'address': ...} или None, если для города нет данных (например, Кугарчи)."""
-    return CITY_BOARDING_INFO.get(direction, {}).get(city)
 
 
 def segments_match_direction(segments, direction: str) -> bool:
@@ -211,12 +184,6 @@ def segments_match_direction(segments, direction: str) -> bool:
         if direction == "return" and a < b:
             return False
     return True
-
-
-@app.get("/api/boarding-info")
-def boarding_info():
-    """Справочник времени/адресов посадки для сайта."""
-    return CITY_BOARDING_INFO
 
 
 @app.get("/api/availability")
@@ -258,14 +225,9 @@ def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)
     total_passengers = sum(seats for _f, _t, seats in segments)
     trip_time = normalize_time(getattr(booking, 'trip_time', None))
 
-    # Посадка: берём то, что прислал сайт; если не прислал — подставляем из справочника
-    boarding_time = booking.boarding_time
-    boarding_address = booking.boarding_address
-    if not boarding_time or not boarding_address:
-        info = get_boarding_info(direction, segments[0][0])
-        if info:
-            boarding_time = boarding_time or info["time"]
-            boarding_address = boarding_address or info["address"]
+    # Точка посадки приходит с сайта. Время может быть пустым (пока уточняется) — сохраняем как NULL.
+    boarding_time = (booking.boarding_time or "").strip() or None
+    boarding_address = (booking.boarding_address or "").strip() or None
 
     with _booking_lock:
         if not check_segments_availability(booking.trip_date, trip_time, segments, db, direction):
@@ -442,6 +404,7 @@ def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks
 Время: {ann.return_time}
 Адрес отправления: {ann.return_address or '—'}
 """
+    phones_text = "\n".join(ADMIN_PHONES)
     body = f"""
 Здравствуйте!
 
@@ -452,7 +415,8 @@ def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks
 {return_block}
 Забронируйте места на нашем сайте!
 
-Если есть вопросы - свяжитесь с нами: +7 (909) 092-09-89
+Если есть вопросы - свяжитесь с нами:
+{phones_text}
 """
     background_tasks.add_task(send_email_to_subscribers, subject, body, db)
     return {"message": "Рассылка запущена в фоне"}
