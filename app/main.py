@@ -23,12 +23,7 @@ resend.api_key = os.getenv("RESEND_API_KEY")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://uralway-pages.pages.dev",
-        "https://golden-zuccutto-687bfd.netlify.app",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    ],
+    allow_origin_regex=r"https://.*\.uralway-pages\.pages\.dev|https://golden-zuccutto-687bfd\.netlify\.app|http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
