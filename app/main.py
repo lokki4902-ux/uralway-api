@@ -23,7 +23,12 @@ resend.api_key = os.getenv("RESEND_API_KEY")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://uralway-pages.pages.dev",
+        "https://golden-zuccutto-687bfd.netlify.app",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -401,7 +406,7 @@ def unban_user(phone: str, db: Session = Depends(get_db)):
 @app.get("/api/banned_users")
 def get_banned_users(db: Session = Depends(get_db)):
     users = db.query(models.User).filter(models.User.is_banned == True).all()
-    return [{"id": u.id, "phone": u.phone, "name": u.name, "ban_reason": u.ban_reason} for u in users]
+    return [{"id": u.id, "phone": u.phone, "name": u.name, "email": u.email, "ban_reason": u.ban_reason} for u in users]
 
 @app.get("/api/check_ban/{phone}")
 def check_ban(phone: str, db: Session = Depends(get_db)):
