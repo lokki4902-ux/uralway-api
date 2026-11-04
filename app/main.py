@@ -4,7 +4,7 @@ from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 import resend
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import or_
+from sqlalchemy import or_, inspect, text
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
 from app.models import Subscriber, User, Booking, Route, BookingSegment
@@ -17,6 +17,22 @@ from . import models
 # Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
+
+def ensure_booking_columns():
+    """create_all не добавляет колонки в уже существующие таблицы. Если в bookings ещё нет новых полей
+    (направление рейса и точка посадки) — добавляем их при запуске. Безопасно вызывать повторно."""
+    insp = inspect(engine)
+    if "bookings" not in insp.get_table_names():
+        return
+    existing = {c["name"] for c in insp.get_columns("bookings")}
+    with engine.begin() as conn:
+        for name in ("trip_direction", "boarding_time", "boarding_address"):
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE bookings ADD COLUMN {name} VARCHAR(255)"))
+
+
+ensure_booking_columns()
+
 app = FastAPI(title="УралWay API", version="1.0")
 
 # Телефоны администраторов (для писем подписчикам)
@@ -26,7 +42,7 @@ resend.api_key = os.getenv("RESEND_API_KEY")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.uralway-pages\.pages\.dev|https://golden-zuccutto-687bfd\.netlify\.app|http://localhost:\d+",
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?uralway-pages\.pages\.dev|https://golden-zuccutto-687bfd\.netlify\.app|http://(localhost|127\.0\.0\.1):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
