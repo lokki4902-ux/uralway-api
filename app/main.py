@@ -1,15 +1,24 @@
+import hmac
+import logging
 import os
+import re
+import secrets
 import threading
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, Request
 import resend
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import jwt  # PyJWT
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import or_, inspect, text
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
 from app.models import Subscriber, User, Booking, Route, BookingSegment
 from app.schemas import SubscriberCreate, SubscriberResponse, BookingCreate
-from datetime import datetime, date as date_type
+from datetime import datetime, date as date_type, timedelta, timezone
 from typing import List, Tuple, Optional
 from . import schemas
 from . import models
@@ -33,23 +42,147 @@ def ensure_booking_columns():
 
 ensure_booking_columns()
 
-app = FastAPI(title="УралWay API", version="1.0")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("uralway")
+
+# В продакшене документацию API (/docs, /redoc, /openapi.json) отключаем
+IS_PROD = os.getenv("ENV", "").lower() == "production"
+app = FastAPI(
+    title="УралWay API", version="1.0",
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json",
+)
 
 # Телефоны администраторов (для писем подписчикам)
 ADMIN_PHONES = ["+7 (919) 400-64-14", "+7 (919) 325-15-39"]
 
 resend.api_key = os.getenv("RESEND_API_KEY")
 
+CORS_ORIGIN_REGEX = r"https://([a-z0-9-]+\.)?uralway-pages\.pages\.dev|https://golden-zuccutto-687bfd\.netlify\.app|http://(localhost|127\.0\.0\.1):\d+"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://([a-z0-9-]+\.)?uralway-pages\.pages\.dev|https://golden-zuccutto-687bfd\.netlify\.app|http://(localhost|127\.0\.0\.1):\d+",
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =====================================================================
+# БЕЗОПАСНОСТЬ: вход в админку (JWT), лимиты запросов, обработка ошибок
+# =====================================================================
+# Переменные окружения:
+#   ADMIN_PASSWORD  — пароль администратора (обязательно, иначе вход отключён)
+#   JWT_SECRET      — секрет для подписи токенов (длинная случайная строка)
+#   ENV=production  — отключает /docs, /redoc и /openapi.json
+#   TRUSTED_PROXY_HOPS — сколько прокси стоит перед сервером (по умолчанию 1; 0 — сервер доступен напрямую)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+TOKEN_TTL = timedelta(hours=24)
+TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
+
+LOGIN_RATE_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "5/minute")
+BOOKING_RATE_LIMIT = os.getenv("BOOKING_RATE_LIMIT", "5/minute")
+SUBSCRIBE_RATE_LIMIT = os.getenv("SUBSCRIBE_RATE_LIMIT", "5/minute")
+CHECK_BAN_RATE_LIMIT = os.getenv("CHECK_BAN_RATE_LIMIT", "30/minute")
+
+if not JWT_SECRET:
+    JWT_SECRET = secrets.token_urlsafe(48)
+    logger.warning("JWT_SECRET не задан: создан временный ключ. После перезапуска (и между воркерами) токены "
+                   "перестанут работать — задайте JWT_SECRET в переменных окружения.")
+if not ADMIN_PASSWORD:
+    logger.warning("ADMIN_PASSWORD не задан — вход в админку отключён.")
+
+SERVER_ERROR_MESSAGE = "Внутренняя ошибка сервера. Попробуйте позже."
+RATE_LIMIT_MESSAGE = "Слишком много запросов. Подождите минуту и попробуйте снова."
+
+
+def client_ip(request: Request) -> str:
+    """IP клиента за прокси: берём адрес, который дописал ближайший доверенный прокси (с конца X-Forwarded-For).
+    Так подделанный клиентом заголовок не позволяет обойти лимиты."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff and TRUSTED_PROXY_HOPS > 0:
+        ips = [p.strip() for p in xff.split(",") if p.strip()]
+        if ips:
+            return ips[-min(TRUSTED_PROXY_HOPS, len(ips))]
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=client_ip)
+app.state.limiter = limiter
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
+    """Зависимость для защищённых эндпоинтов: требует заголовок Authorization: Bearer <token>."""
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Требуется авторизация", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        return jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Сессия истекла. Войдите снова.", headers={"WWW-Authenticate": "Bearer"})
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Недействительный токен", headers={"WWW-Authenticate": "Bearer"})
+
+
+def _cors_headers(request: Request) -> dict:
+    """Необработанные ошибки (500) формируются снаружи CORS-middleware — добавляем заголовки вручную,
+    иначе браузер покажет CORS-ошибку вместо понятного сообщения."""
+    origin = request.headers.get("origin")
+    if origin and re.fullmatch(CORS_ORIGIN_REGEX, origin):
+        return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
+    return {}
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    logger.warning("Превышен лимит запросов: %s %s с IP %s", request.method, request.url.path, client_ip(request))
+    return JSONResponse(status_code=429, content={"error": RATE_LIMIT_MESSAGE, "detail": RATE_LIMIT_MESSAGE},
+                        headers={"Retry-After": "60"})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Подробности (с traceback) — только в логи, клиенту — аккуратный JSON
+    logger.exception("Необработанная ошибка: %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"error": SERVER_ERROR_MESSAGE}, headers=_cors_headers(request))
+
+
+class LoginRequest(BaseModel):
+    password: str = Field(max_length=200)
+
+
+@app.get("/api/health")
+def health():
+    """Для мониторинга: сервер жив."""
+    return {"status": "ok"}
+
+
+@app.post("/api/login")
+@limiter.limit(LOGIN_RATE_LIMIT)
+def login(request: Request, data: LoginRequest):
+    """Вход администратора: пароль из ADMIN_PASSWORD -> JWT на 24 часа."""
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Вход в админку не настроен на сервере")
+    if not hmac.compare_digest(data.password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+        logger.warning("Неудачная попытка входа в админку с IP %s", client_ip(request))
+        raise HTTPException(status_code=401, detail="Неверный пароль")
+    now = datetime.now(timezone.utc)
+    token = jwt.encode({"sub": "admin", "iat": now, "exp": now + TOKEN_TTL}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"access_token": token, "token_type": "bearer", "expires_in": int(TOKEN_TTL.total_seconds())}
+
+
+@app.get("/api/me", dependencies=[Depends(verify_token)])
+def me():
+    """Проверка токена (фронтенд вызывает при открытии админки)."""
+    return {"role": "admin"}
+
+
 class BanRequest(BaseModel):
-    reason: str
+    reason: str = Field(max_length=255)
 
 class AnnouncementEmail(BaseModel):
     date: str
@@ -65,7 +198,8 @@ def read_root():
     return {"message": "УралWay API работает!", "timestamp": datetime.now()}
 
 @app.post("/api/subscribe", response_model=SubscriberResponse)
-def subscribe(subscriber: SubscriberCreate, db: Session = Depends(get_db)):
+@limiter.limit(SUBSCRIBE_RATE_LIMIT)
+def subscribe(request: Request, subscriber: SubscriberCreate, db: Session = Depends(get_db)):
     existing = db.query(Subscriber).filter(Subscriber.email == subscriber.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Этот email уже подписан")
@@ -218,11 +352,15 @@ def get_availability(
 
 
 @app.post("/api/booking")
-def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
+@limiter.limit(BOOKING_RATE_LIMIT)
+def create_booking(request: Request, booking: schemas.BookingCreate, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == booking.phone).first()
 
     if user and user.is_banned:
         raise HTTPException(status_code=403, detail="Пользователь забанен. Бронирование невозможно.")
+
+    if booking.consent is not True:
+        raise HTTPException(status_code=400, detail="Необходимо согласие на обработку персональных данных")
 
     # Участки заявки: из segments, либо (старые клиенты) из from_city/to_city/passengers
     if booking.segments:
@@ -294,7 +432,7 @@ def create_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)
     return {"message": "Бронирование создано!", "booking_id": new_booking.id}
 
 
-@app.get("/api/bookings")
+@app.get("/api/bookings", dependencies=[Depends(verify_token)])
 def get_bookings(db: Session = Depends(get_db)):
     bookings = db.query(models.Booking).order_by(models.Booking.id.desc()).all()
     result = []
@@ -322,8 +460,10 @@ def get_bookings(db: Session = Depends(get_db)):
         })
     return result
 
-@app.patch("/api/bookings/{booking_id}")
+@app.patch("/api/bookings/{booking_id}", dependencies=[Depends(verify_token)])
 def update_booking_status(booking_id: int, status: str, db: Session = Depends(get_db)):
+    if status not in ("new", "confirmed", "cancelled", "completed"):
+        raise HTTPException(status_code=400, detail="Недопустимый статус заявки")
     booking = db.query(models.Booking).filter(models.Booking.id == booking_id).first()
     if booking:
         if hasattr(booking, 'status'):
@@ -334,7 +474,7 @@ def update_booking_status(booking_id: int, status: str, db: Session = Depends(ge
             return {"error": "В модели Booking нет поля status"}
     return {"error": "Booking not found"}
 
-@app.delete("/api/bookings/{booking_id}")
+@app.delete("/api/bookings/{booking_id}", dependencies=[Depends(verify_token)])
 def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     booking = db.query(models.Booking).filter(models.Booking.id == booking_id).first()
     if booking:
@@ -344,7 +484,7 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
         return {"message": "Booking deleted"}
     return {"error": "Booking not found"}
 
-@app.get("/api/subscribers")
+@app.get("/api/subscribers", dependencies=[Depends(verify_token)])
 def get_subscribers(db: Session = Depends(get_db)):
     subs = db.query(models.Subscriber).order_by(models.Subscriber.id.desc()).all()
     result = []
@@ -356,7 +496,7 @@ def get_subscribers(db: Session = Depends(get_db)):
         })
     return result
 
-@app.post("/api/ban_user/{phone}")
+@app.post("/api/ban_user/{phone}", dependencies=[Depends(verify_token)])
 def ban_user(phone: str, req: BanRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == phone).first()
     if not user:
@@ -366,7 +506,7 @@ def ban_user(phone: str, req: BanRequest, db: Session = Depends(get_db)):
     db.commit()
     return {"message": f"Пользователь {phone} забанен"}
 
-@app.post("/api/unban_user/{phone}")
+@app.post("/api/unban_user/{phone}", dependencies=[Depends(verify_token)])
 def unban_user(phone: str, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == phone).first()
     if not user:
@@ -376,13 +516,14 @@ def unban_user(phone: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": f"Пользователь {phone} разбанен"}
 
-@app.get("/api/banned_users")
+@app.get("/api/banned_users", dependencies=[Depends(verify_token)])
 def get_banned_users(db: Session = Depends(get_db)):
     users = db.query(models.User).filter(models.User.is_banned == True).all()
     return [{"id": u.id, "phone": u.phone, "name": u.name, "email": u.email, "ban_reason": u.ban_reason} for u in users]
 
 @app.get("/api/check_ban/{phone}")
-def check_ban(phone: str, db: Session = Depends(get_db)):
+@limiter.limit(CHECK_BAN_RATE_LIMIT)
+def check_ban(request: Request, phone: str, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == phone).first()
     if user and user.is_banned:
         return {"is_banned": True}
@@ -409,7 +550,7 @@ def send_email_to_subscribers(subject: str, body: str, db: Session):
     except Exception as e:
         print(f"Ошибка отправки через Resend: {e}")
 
-@app.post("/api/notify_subscribers")
+@app.post("/api/notify_subscribers", dependencies=[Depends(verify_token)])
 def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     subject = "УралWay: Новый рейс!"
     return_block = ""
