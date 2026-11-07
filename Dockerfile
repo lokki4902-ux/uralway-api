@@ -15,6 +15,7 @@ RUN groupadd --system --gid 10001 app \
 # Сначала зависимости — так сборка использует кэш слоёв
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir PyJWT
 
 # Код приложения принадлежит app, остальное остаётся у root (только чтение)
 COPY --chown=app:app app ./app
