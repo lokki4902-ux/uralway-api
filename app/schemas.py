@@ -1,4 +1,5 @@
-from pydantic import BaseModel, EmailStr, Field
+import re
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import date, datetime
 from typing import Optional, List, Literal
 
@@ -35,7 +36,7 @@ class BookingSegmentIn(BaseModel):
 # Схема для создания бронирования
 class BookingCreate(BaseModel):
     phone: str
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=100)
     email: Optional[EmailStr] = None
     from_city: str
     to_city: str
@@ -46,11 +47,21 @@ class BookingCreate(BaseModel):
     boarding_time: Optional[str] = None
     boarding_address: Optional[str] = None
     passengers: int = 1
-    comment: Optional[str] = None
+    comment: Optional[str] = Field(None, max_length=2000)
     total_price: Optional[int] = 0
     total_km: Optional[int] = 0
+    # согласие на обработку персональных данных (152-ФЗ): без него заявка не принимается
+    consent: Optional[bool] = None
     # Новое: список участков (строки формы). Если не передан — берутся from_city/to_city/passengers
     segments: Optional[List[BookingSegmentIn]] = None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        digits = re.sub(r"\D", "", v or "")
+        if not 10 <= len(digits) <= 15:
+            raise ValueError("Некорректный номер телефона")
+        return v.strip()
 
 # Схема для ОТВЕТА при получении заявки (для админки)
 class BookingResponse(BaseModel):
