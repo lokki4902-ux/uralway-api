@@ -16,6 +16,7 @@ RUN groupadd --system --gid 10001 app \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 RUN pip install --no-cache-dir PyJWT
+RUN pip install --no-cache-dir slowapi
 
 # Код приложения принадлежит app, остальное остаётся у root (только чтение)
 COPY --chown=app:app app ./app
