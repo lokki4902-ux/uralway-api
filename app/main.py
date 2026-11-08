@@ -714,3 +714,46 @@ def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks
 """
     background_tasks.add_task(send_email_to_subscribers, subject, body, db)
     return {"message": "Рассылка запущена в фоне"}
+
+
+# =====================================================================
+# ДОПОЛНИТЕЛЬНЫЕ УСЛУГИ: трансфер и перевозка посылок (только для администратора)
+# =====================================================================
+# Города, между которыми возят посылки (попутно с пассажирами по основному маршруту)
+PARCEL_CITIES = set(CITIES_ORDER) | {"Кугарчи", "Аманат", "Тазларово"}
+
+
+@app.post("/api/extra-services", response_model=schemas.ExtraServiceResponse, dependencies=[Depends(verify_token)])
+def create_extra_service(data: schemas.ExtraServiceCreate, db: Session = Depends(get_db)):
+    """Трансфер — любые города и адреса, посылка — попутный груз: города маршрута + точный адрес доставки."""
+    delivery_address = None
+    if data.service_type == "parcel":
+        if data.from_location not in PARCEL_CITIES or data.to_location not in PARCEL_CITIES:
+            raise HTTPException(status_code=400, detail="Для посылки выберите города из списка маршрута")
+        if data.from_location == data.to_location:
+            raise HTTPException(status_code=400, detail="Города отправления и доставки совпадают")
+        if not data.delivery_address:
+            raise HTTPException(status_code=400, detail="Для посылки укажите точный адрес доставки")
+        delivery_address = data.delivery_address
+
+    service = models.ExtraService(
+        service_type=data.service_type,
+        client_name=data.client_name,
+        phone=data.phone,
+        from_location=data.from_location,
+        to_location=data.to_location,
+        delivery_address=delivery_address,
+        service_date=data.service_date,
+        amount=data.amount,
+        comment=data.comment or None,
+    )
+    db.add(service)
+    db.commit()
+    db.refresh(service)
+    return service
+
+
+@app.get("/api/extra-services", response_model=List[schemas.ExtraServiceResponse], dependencies=[Depends(verify_token)])
+def get_extra_services(db: Session = Depends(get_db)):
+    """Все дополнительные услуги, новые сверху."""
+    return db.query(models.ExtraService).order_by(models.ExtraService.id.desc()).all()
