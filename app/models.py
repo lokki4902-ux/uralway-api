@@ -76,3 +76,20 @@ class Review(Base):
     rating = Column(Integer)
     comment = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# Дополнительные услуги: трансфер (аренда авто) и перевозка посылок
+class ExtraService(Base):
+    __tablename__ = "extra_services"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_type = Column(String(20), nullable=False, index=True)   # "transfer" | "parcel"
+    client_name = Column(String(100), nullable=False)               # ФИО отправителя / арендатора
+    phone = Column(String(30), nullable=False)
+    from_location = Column(String(255), nullable=False)             # откуда (город/адрес)
+    to_location = Column(String(255), nullable=False)               # куда (город)
+    delivery_address = Column(String(500), nullable=True)           # точный адрес доставки (только посылки)
+    service_date = Column(Date, nullable=False)                     # дата оказания услуги
+    amount = Column(Integer, nullable=False, default=0)             # стоимость
+    comment = Column(String(1000), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
