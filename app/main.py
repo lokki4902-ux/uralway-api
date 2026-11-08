@@ -6,6 +6,7 @@ import re
 import secrets
 import threading
 import time
+from urllib.parse import quote, urlencode
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, Request
 import resend
 from pydantic import BaseModel, EmailStr, Field
@@ -197,7 +198,10 @@ def me():
 # В Метрике создайте цель типа «JavaScript-событие» с идентификатором offline_booking_success.
 METRIKA_COUNTER_ID = os.getenv("METRIKA_COUNTER_ID", "114068100")
 METRIKA_MP_TOKEN = os.getenv("METRIKA_MP_TOKEN")
-METRIKA_COLLECT_URL = "https://mc.yandex.ru/collect"
+METRIKA_COLLECT_URL = "https://mc.yandex.ru/collect/"  # со слэшем на конце — как в документации
+# По документации сессию создаёт только pageview, поэтому он отправляется первым. Если нужен только хит цели
+# (без pageview), задайте METRIKA_SEND_PAGEVIEW=0 — но данные могут не засчитаться без открытой сессии.
+METRIKA_SEND_PAGEVIEW = os.getenv("METRIKA_SEND_PAGEVIEW", "1") != "0"
 SITE_URL = os.getenv("SITE_URL", "https://uralway-pages.pages.dev").rstrip("/")
 OFFLINE_PAGE_URL = f"{SITE_URL}/offline-booking"      # виртуальная страница офлайн-визита
 OFFLINE_GOAL_ID = "offline_booking_success"           # идентификатор JS-цели в Метрике
@@ -215,8 +219,9 @@ def _money(value: float) -> str:
     return str(int(value)) if value == int(value) else f"{value:.2f}"
 
 
-def build_offline_metrika_hits(*, booking_id: int, total_price: int, direction: str, segments, cid: str, now: int) -> list:
-    """Три запроса одного визита (без токена): pageview -> цель -> покупка.
+def build_offline_metrika_hits(*, booking_id: int, total_price: int, direction: str, segments, cid: str, now: int,
+                               with_pageview: bool = True) -> list:
+    """Запросы одного визита (без токена): [pageview ->] цель (t=event, ea=...) -> покупка (t=event, pa=purchase).
     Время хитов (et) идёт по возрастанию и не уходит в будущее."""
     seats = sum(s.seats for s in segments)
     route_text = "; ".join(f"{s.from_city}-{s.to_city}" for s in segments)
@@ -239,16 +244,29 @@ def build_offline_metrika_hits(*, booking_id: int, total_price: int, direction: 
                          f"pr{i}ca": DIRECTION_LABELS.get(direction, direction),
                          f"pr{i}pr": _money(price), f"pr{i}qt": qty})
 
-    return [
-        {**base, "t": "pageview", "et": now - 2, "dr": f"{SITE_URL}/", "dt": "Офлайн-заявка"},
-        {**base, "t": "event", "et": now - 1, "ea": OFFLINE_GOAL_ID, "ev": total_price, "cu": "RUB", "params": visit_params},
-        purchase,
-    ]
+    hits = []
+    if with_pageview:
+        hits.append({**base, "t": "pageview", "et": now - 2, "dr": f"{SITE_URL}/", "dt": "Офлайн-заявка"})
+    hits.append({**base, "t": "event", "et": now - 1, "ea": OFFLINE_GOAL_ID, "ev": total_price, "cu": "RUB", "params": visit_params})
+    hits.append(purchase)
+    return hits
+
+
+def _metrika_url(hit: dict) -> str:
+    """URL запроса: все значения (в том числе dl) кодируются как UTF-8 + percent-encoding."""
+    return f"{METRIKA_COLLECT_URL}?{urlencode(hit, quote_via=quote)}"
+
+
+def _hit_name(hit: dict) -> str:
+    if hit.get("t") == "pageview":
+        return "pageview"
+    return f"goal:{hit['ea']}" if hit.get("ea") else f"ecommerce:{hit.get('pa')}"
 
 
 async def send_offline_booking_to_metrika(*, booking_id: int, total_price: int, direction: str, segments) -> bool:
-    """Отправляет офлайн-заявку в Метрику. Никогда не выбрасывает исключений: сбой аналитики
-    не должен ломать создание заявки. Возвращает True, если все запросы приняты."""
+    """Отправляет офлайн-заявку в Метрику (Measurement Protocol, GET https://mc.yandex.ru/collect/).
+    Никогда не выбрасывает исключений: сбой аналитики не должен ломать создание заявки.
+    Возвращает True, если все запросы приняты."""
     if not METRIKA_MP_TOKEN:
         print("Ошибка отправки в Метрику")
         logger.warning("METRIKA_MP_TOKEN не задан — офлайн-заявка %s в Метрику не отправлена", booking_id)
@@ -256,14 +274,21 @@ async def send_offline_booking_to_metrika(*, booking_id: int, total_price: int, 
     try:
         hits = build_offline_metrika_hits(
             booking_id=booking_id, total_price=int(total_price or 0), direction=direction,
-            segments=segments, cid=_new_client_id(), now=int(time.time()),
+            segments=segments, cid=_new_client_id(), now=int(time.time()), with_pageview=METRIKA_SEND_PAGEVIEW,
         )
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        failed = []
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), follow_redirects=True) as client:
             for hit in hits:
-                response = await client.post(METRIKA_COLLECT_URL, params={**hit, "ms": METRIKA_MP_TOKEN})
+                response = await client.get(_metrika_url({**hit, "ms": METRIKA_MP_TOKEN}))
                 if response.status_code >= 400:
-                    raise RuntimeError(f"HTTP {response.status_code}")
-        logger.info("Офлайн-заявка %s отправлена в Метрику", booking_id)
+                    # какой именно запрос отклонён и что ответила Метрика (в тексте ответа токена нет)
+                    failed.append(_hit_name(hit))
+                    logger.warning("Метрика отклонила запрос %s (заявка %s): HTTP %s, ответ: %r",
+                                   _hit_name(hit), booking_id, response.status_code, response.text[:200])
+        if failed:
+            print("Ошибка отправки в Метрику")
+            return False
+        logger.info("Офлайн-заявка %s отправлена в Метрику (%s)", booking_id, ", ".join(_hit_name(h) for h in hits))
         return True
     except Exception as exc:
         print("Ошибка отправки в Метрику")
