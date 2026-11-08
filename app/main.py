@@ -1,15 +1,19 @@
 import hmac
+import json
 import logging
 import os
 import re
 import secrets
 import threading
+import time
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, Request
 import resend
 from pydantic import BaseModel, EmailStr, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
+import httpx
 import jwt  # PyJWT
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -179,6 +183,93 @@ def login(request: Request, data: LoginRequest):
 def me():
     """Проверка токена (фронтенд вызывает при открытии админки)."""
     return {"role": "admin"}
+
+
+# =====================================================================
+# ЯНДЕКС.МЕТРИКА: серверная отправка офлайн-заявок (Measurement Protocol)
+# =====================================================================
+# Заявки, которые админ вносит вручную (клиент позвонил), веб-счётчик не видит. Мы создаём в Метрике
+# «виртуальный визит»: просмотр страницы -> цель -> покупка (электронная коммерция).
+# Документация: https://yandex.com/dev/metrika/ru/data-import/measurement-upload
+#
+# Настройка (один раз): в счётчике «Настройка → Загрузка данных → Measurement Protocol» включите опцию
+# и скопируйте секретный токен в переменную окружения METRIKA_MP_TOKEN. Без токена данные не принимаются.
+# В Метрике создайте цель типа «JavaScript-событие» с идентификатором offline_booking_success.
+METRIKA_COUNTER_ID = os.getenv("METRIKA_COUNTER_ID", "114068100")
+METRIKA_MP_TOKEN = os.getenv("METRIKA_MP_TOKEN")
+METRIKA_COLLECT_URL = "https://mc.yandex.ru/collect"
+SITE_URL = os.getenv("SITE_URL", "https://uralway-pages.pages.dev").rstrip("/")
+OFFLINE_PAGE_URL = f"{SITE_URL}/offline-booking"      # виртуальная страница офлайн-визита
+OFFLINE_GOAL_ID = "offline_booking_success"           # идентификатор JS-цели в Метрике
+DIRECTION_LABELS = {"forward": "Туда", "return": "Обратно"}
+
+
+def _new_client_id() -> str:
+    """ClientID офлайн-клиента. У звонящего нет браузерной cookie, поэтому создаём новый идентификатор
+    в том же числовом формате, что и _ym_uid (10 цифр unix-времени + 9 случайных цифр)."""
+    return f"{int(time.time())}{secrets.randbelow(10 ** 9):09d}"
+
+
+def _money(value: float) -> str:
+    value = round(float(value), 2)
+    return str(int(value)) if value == int(value) else f"{value:.2f}"
+
+
+def build_offline_metrika_hits(*, booking_id: int, total_price: int, direction: str, segments, cid: str, now: int) -> list:
+    """Три запроса одного визита (без токена): pageview -> цель -> покупка.
+    Время хитов (et) идёт по возрастанию и не уходит в будущее."""
+    seats = sum(s.seats for s in segments)
+    route_text = "; ".join(f"{s.from_city}-{s.to_city}" for s in segments)
+    base = {"tid": METRIKA_COUNTER_ID, "cid": cid, "dl": OFFLINE_PAGE_URL}
+
+    # Параметры визита: сумма, маршрут, количество мест (вместо «ep» из ТЗ — в протоколе это поле params)
+    visit_params = json.dumps({
+        "order_id": str(booking_id), "source": "manual", "order_price": total_price,
+        "route": route_text, "seats": seats, "direction": direction,
+    }, ensure_ascii=False)
+
+    # Товары покупки: по строке на участок (если известна цена участка), иначе одним товаром на всю заявку
+    if segments and all(s.price is not None for s in segments):
+        products = [(f"{s.from_city}-{s.to_city}", f"{s.from_city} — {s.to_city}", s.price / s.seats, s.seats) for s in segments]
+    else:
+        products = [(route_text or "booking", route_text or "Заявка", total_price / max(seats, 1), max(seats, 1))]
+    purchase = {**base, "t": "event", "et": now, "pa": "purchase", "ti": str(booking_id), "tr": total_price, "cu": "RUB"}
+    for i, (pid, name, price, qty) in enumerate(products, start=1):
+        purchase.update({f"pr{i}id": pid, f"pr{i}nm": name, f"pr{i}br": "УралWay",
+                         f"pr{i}ca": DIRECTION_LABELS.get(direction, direction),
+                         f"pr{i}pr": _money(price), f"pr{i}qt": qty})
+
+    return [
+        {**base, "t": "pageview", "et": now - 2, "dr": f"{SITE_URL}/", "dt": "Офлайн-заявка"},
+        {**base, "t": "event", "et": now - 1, "ea": OFFLINE_GOAL_ID, "ev": total_price, "cu": "RUB", "params": visit_params},
+        purchase,
+    ]
+
+
+async def send_offline_booking_to_metrika(*, booking_id: int, total_price: int, direction: str, segments) -> bool:
+    """Отправляет офлайн-заявку в Метрику. Никогда не выбрасывает исключений: сбой аналитики
+    не должен ломать создание заявки. Возвращает True, если все запросы приняты."""
+    if not METRIKA_MP_TOKEN:
+        print("Ошибка отправки в Метрику")
+        logger.warning("METRIKA_MP_TOKEN не задан — офлайн-заявка %s в Метрику не отправлена", booking_id)
+        return False
+    try:
+        hits = build_offline_metrika_hits(
+            booking_id=booking_id, total_price=int(total_price or 0), direction=direction,
+            segments=segments, cid=_new_client_id(), now=int(time.time()),
+        )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            for hit in hits:
+                response = await client.post(METRIKA_COLLECT_URL, params={**hit, "ms": METRIKA_MP_TOKEN})
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}")
+        logger.info("Офлайн-заявка %s отправлена в Метрику", booking_id)
+        return True
+    except Exception as exc:
+        print("Ошибка отправки в Метрику")
+        # URL запроса содержит секретный токен — в лог пишем только тип ошибки
+        logger.warning("Ошибка отправки в Метрику (заявка %s): %s", booking_id, type(exc).__name__)
+        return False
 
 
 class BanRequest(BaseModel):
@@ -354,12 +445,31 @@ def get_availability(
 @app.post("/api/booking")
 @limiter.limit(BOOKING_RATE_LIMIT)
 def create_booking(request: Request, booking: schemas.BookingCreate, db: Session = Depends(get_db)):
+    """Заявка с сайта. Поле source из публичного запроса игнорируется: в аналитику как «офлайн» не попадает."""
+    return _process_booking(booking, db, require_consent=True)
+
+
+@app.post("/api/admin/booking", dependencies=[Depends(verify_token)])
+async def create_manual_booking(booking: schemas.BookingCreate, db: Session = Depends(get_db)):
+    """Ручная заявка (клиент позвонил). Только для администратора. Создаёт заявку и передаёт её в Метрику.
+    Сбой аналитики заявку не отменяет — в ответе поле analytics_sent показывает результат."""
+    result = await run_in_threadpool(_process_booking, booking, db, False)
+    segments = booking.segments or [schemas.BookingSegmentIn(
+        from_city=booking.from_city, to_city=booking.to_city, seats=booking.passengers)]
+    analytics_sent = await send_offline_booking_to_metrika(
+        booking_id=result["booking_id"], total_price=booking.total_price or 0,
+        direction=booking.trip_direction or "forward", segments=segments)
+    return {**result, "source": "manual", "analytics_sent": analytics_sent}
+
+
+def _process_booking(booking: schemas.BookingCreate, db: Session, require_consent: bool):
+    """Общая логика создания заявки (проверка бана, мест по участкам, запись в БД)."""
     user = db.query(models.User).filter(models.User.phone == booking.phone).first()
 
     if user and user.is_banned:
         raise HTTPException(status_code=403, detail="Пользователь забанен. Бронирование невозможно.")
 
-    if booking.consent is not True:
+    if require_consent and booking.consent is not True:
         raise HTTPException(status_code=400, detail="Необходимо согласие на обработку персональных данных")
 
     # Участки заявки: из segments, либо (старые клиенты) из from_city/to_city/passengers
