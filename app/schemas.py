@@ -31,6 +31,7 @@ class BookingSegmentIn(BaseModel):
     from_city: str
     to_city: str
     seats: int = Field(ge=1, le=8)
+    price: Optional[int] = Field(None, ge=0)  # стоимость строки (для аналитики), в БД не сохраняется
 
 
 # Схема для создания бронирования
@@ -52,6 +53,8 @@ class BookingCreate(BaseModel):
     total_km: Optional[int] = 0
     # согласие на обработку персональных данных (152-ФЗ): без него заявка не принимается
     consent: Optional[bool] = None
+    # откуда заявка. Для публичного /api/booking игнорируется; ручные заявки идут через /api/admin/booking
+    source: Optional[Literal["web", "manual"]] = "web"
     # Новое: список участков (строки формы). Если не передан — берутся from_city/to_city/passengers
     segments: Optional[List[BookingSegmentIn]] = None
 
