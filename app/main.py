@@ -227,9 +227,11 @@ def build_offline_metrika_hits(*, booking_id: int, total_price: int, direction: 
     route_text = "; ".join(f"{s.from_city}-{s.to_city}" for s in segments)
     base = {"tid": METRIKA_COUNTER_ID, "cid": cid, "dl": OFFLINE_PAGE_URL}
 
-    # Параметры визита: сумма, маршрут, количество мест (вместо «ep» из ТЗ — в протоколе это поле params)
+    # Параметры визита (params). Ключи order_price и currency Метрика зарезервировала под доход цели и в params
+    # не принимает (ответ 400: "Value of 'params' contain forbidden key"). Доход передаётся полями
+    # tr / pr<N>pr / ev, а здесь — только маршрут, число мест и источник.
     visit_params = json.dumps({
-        "order_id": str(booking_id), "source": "manual", "order_price": total_price,
+        "booking_id": str(booking_id), "source": "manual",
         "route": route_text, "seats": seats, "direction": direction,
     }, ensure_ascii=False)
 
