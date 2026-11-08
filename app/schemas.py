@@ -86,3 +86,46 @@ class BookingResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ---------- Дополнительные услуги: трансфер и посылки ----------
+class ExtraServiceCreate(BaseModel):
+    service_type: Literal["transfer", "parcel"]
+    client_name: str = Field(min_length=1, max_length=100)
+    phone: str
+    from_location: str = Field(min_length=1, max_length=255)
+    to_location: str = Field(min_length=1, max_length=255)
+    delivery_address: Optional[str] = Field(None, max_length=500)   # обязателен для посылки (проверяет эндпоинт)
+    service_date: date
+    amount: int = Field(ge=0, le=10_000_000)
+    comment: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator("client_name", "from_location", "to_location", "delivery_address", "comment", mode="before")
+    @classmethod
+    def strip_text(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        digits = re.sub(r"\D", "", v or "")
+        if not 10 <= len(digits) <= 15:
+            raise ValueError("Некорректный номер телефона")
+        return v.strip()
+
+
+class ExtraServiceResponse(BaseModel):
+    id: int
+    service_type: str
+    client_name: str
+    phone: str
+    from_location: str
+    to_location: str
+    delivery_address: Optional[str] = None
+    service_date: date
+    amount: int
+    comment: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
