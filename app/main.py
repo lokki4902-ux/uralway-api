@@ -7,9 +7,8 @@ import secrets
 import threading
 import time
 from urllib.parse import quote, urlencode
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, Request
-import resend
-from pydantic import BaseModel, EmailStr, Field
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -21,8 +20,8 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import or_, inspect, text
 from sqlalchemy.orm import Session
 from app.database import engine, get_db, Base
-from app.models import Subscriber, User, Booking, Route, BookingSegment
-from app.schemas import SubscriberCreate, SubscriberResponse, BookingCreate
+from app.models import User, Booking, Route, BookingSegment
+from app.schemas import BookingCreate
 from datetime import datetime, date as date_type, timedelta, timezone
 from typing import List, Tuple, Optional
 from . import schemas
@@ -47,6 +46,29 @@ def ensure_booking_columns():
 
 ensure_booking_columns()
 
+
+def ensure_reviews_schema():
+    """Таблица reviews сменила структуру (name/phone/email/rating/text вместо booking_id/comment).
+    create_all существующие таблицы не меняет. Если осталась старая ПУСТАЯ таблица — пересоздаём её;
+    если в ней есть данные — останавливаем запуск с понятным сообщением (см. migration_3.sql)."""
+    insp = inspect(engine)
+    if "reviews" not in insp.get_table_names():
+        return
+    columns = {c["name"] for c in insp.get_columns("reviews")}
+    if {"name", "phone", "email", "rating", "text"} <= columns:
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT COUNT(*) FROM reviews")).scalar()
+    if rows:
+        raise RuntimeError("Таблица reviews имеет старую структуру и содержит данные. "
+                           "Выполните migration_3.sql вручную (сохраните нужные данные заранее).")
+    models.Review.__table__.drop(bind=engine)
+    models.Review.__table__.create(bind=engine)
+    print("Таблица reviews пересоздана с новой структурой")
+
+
+ensure_reviews_schema()
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("uralway")
 
@@ -58,11 +80,6 @@ app = FastAPI(
     redoc_url=None if IS_PROD else "/redoc",
     openapi_url=None if IS_PROD else "/openapi.json",
 )
-
-# Телефоны администраторов (для писем подписчикам)
-ADMIN_PHONES = ["+7 (919) 400-64-14", "+7 (919) 325-15-39"]
-
-resend.api_key = os.getenv("RESEND_API_KEY")
 
 CORS_ORIGIN_REGEX = r"https://([a-z0-9-]+\.)?uralway-pages\.pages\.dev|https://golden-zuccutto-687bfd\.netlify\.app|http://(localhost|127\.0\.0\.1):\d+"
 
@@ -90,7 +107,7 @@ TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
 
 LOGIN_RATE_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "5/minute")
 BOOKING_RATE_LIMIT = os.getenv("BOOKING_RATE_LIMIT", "5/minute")
-SUBSCRIBE_RATE_LIMIT = os.getenv("SUBSCRIBE_RATE_LIMIT", "5/minute")
+REVIEW_RATE_LIMIT = os.getenv("REVIEW_RATE_LIMIT", "3/minute")
 CHECK_BAN_RATE_LIMIT = os.getenv("CHECK_BAN_RATE_LIMIT", "30/minute")
 
 if not JWT_SECRET:
@@ -302,31 +319,9 @@ async def send_offline_booking_to_metrika(*, booking_id: int, total_price: int, 
 class BanRequest(BaseModel):
     reason: str = Field(max_length=255)
 
-class AnnouncementEmail(BaseModel):
-    date: str
-    time: str
-    address: str
-    # Необязательно: обратный рейс того же цикла
-    return_date: Optional[str] = None
-    return_time: Optional[str] = None
-    return_address: Optional[str] = None
-
 @app.get("/")
 def read_root():
     return {"message": "УралWay API работает!", "timestamp": datetime.now()}
-
-@app.post("/api/subscribe", response_model=SubscriberResponse)
-@limiter.limit(SUBSCRIBE_RATE_LIMIT)
-def subscribe(request: Request, subscriber: SubscriberCreate, db: Session = Depends(get_db)):
-    existing = db.query(Subscriber).filter(Subscriber.email == subscriber.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Этот email уже подписан")
-    
-    new_subscriber = Subscriber(email=subscriber.email)
-    db.add(new_subscriber)
-    db.commit()
-    db.refresh(new_subscriber)
-    return new_subscriber
 
 # =====================================================================
 # СЕГМЕНТНОЕ БРОНИРОВАНИЕ
@@ -621,18 +616,6 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
         return {"message": "Booking deleted"}
     return {"error": "Booking not found"}
 
-@app.get("/api/subscribers", dependencies=[Depends(verify_token)])
-def get_subscribers(db: Session = Depends(get_db)):
-    subs = db.query(models.Subscriber).order_by(models.Subscriber.id.desc()).all()
-    result = []
-    for s in subs:
-        result.append({
-            "id": s.id,
-            "email": s.email,
-            "created_at": str(s.created_at)
-        })
-    return result
-
 @app.post("/api/ban_user/{phone}", dependencies=[Depends(verify_token)])
 def ban_user(phone: str, req: BanRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.phone == phone).first()
@@ -665,56 +648,6 @@ def check_ban(request: Request, phone: str, db: Session = Depends(get_db)):
     if user and user.is_banned:
         return {"is_banned": True}
     return {"is_banned": False}
-
-def send_email_to_subscribers(subject: str, body: str, db: Session):
-    subscribers = db.query(models.Subscriber).all()
-    emails = [sub.email for sub in subscribers]
-
-    if not emails:
-        print("Нет подписчиков для рассылки.")
-        return
-
-    try:
-        for email in emails:
-            params = {
-                "from": "UralWay <onboarding@resend.dev>",
-                "to": [email],
-                "subject": subject,
-                "text": body,
-            }
-            resend.Emails.send(params)
-        print(f"Успешно отправлено {len(emails)} писем через Resend.")
-    except Exception as e:
-        print(f"Ошибка отправки через Resend: {e}")
-
-@app.post("/api/notify_subscribers", dependencies=[Depends(verify_token)])
-def notify_subscribers(ann: AnnouncementEmail, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    subject = "УралWay: Новый рейс!"
-    return_block = ""
-    if ann.return_date and ann.return_time:
-        return_block = f"""
-Обратный рейс (Оренбург ➔ Магнитогорск):
-Дата: {ann.return_date}
-Время: {ann.return_time}
-Адрес отправления: {ann.return_address or '—'}
-"""
-    phones_text = "\n".join(ADMIN_PHONES)
-    body = f"""
-Здравствуйте!
-
-Опубликован новый рейс:
-Дата: {ann.date}
-Время: {ann.time}
-Адрес отправления: {ann.address}
-{return_block}
-Забронируйте места на нашем сайте!
-
-Если есть вопросы - свяжитесь с нами:
-{phones_text}
-"""
-    background_tasks.add_task(send_email_to_subscribers, subject, body, db)
-    return {"message": "Рассылка запущена в фоне"}
-
 
 # =====================================================================
 # ДОПОЛНИТЕЛЬНЫЕ УСЛУГИ: трансфер и перевозка посылок (только для администратора)
@@ -757,3 +690,94 @@ def create_extra_service(data: schemas.ExtraServiceCreate, db: Session = Depends
 def get_extra_services(db: Session = Depends(get_db)):
     """Все дополнительные услуги, новые сверху."""
     return db.query(models.ExtraService).order_by(models.ExtraService.id.desc()).all()
+
+
+# =====================================================================
+# АНОНСЫ РЕЙСОВ (раньше хранились в localStorage браузера администратора)
+# =====================================================================
+@app.get("/api/announcements", response_model=List[schemas.AnnouncementResponse])
+def get_announcements(db: Session = Depends(get_db)):
+    """Публичный список рейсов (по возрастанию даты и времени)."""
+    return db.query(models.Announcement).order_by(models.Announcement.date, models.Announcement.time, models.Announcement.id).all()
+
+
+@app.post("/api/announcements", response_model=schemas.AnnouncementResponse, dependencies=[Depends(verify_token)])
+def create_announcement(data: schemas.AnnouncementCreate, db: Session = Depends(get_db)):
+    """Один рейс. Для цикла «туда + обратно» удобнее POST /api/announcements/cycle."""
+    announcement = models.Announcement(
+        date=data.date, time=data.time, address=data.address, driver_id=data.driver_id,
+        direction=data.direction, occupied_seats=data.occupied_seats, cycle_id=data.cycle_id,
+    )
+    db.add(announcement)
+    db.commit()
+    db.refresh(announcement)
+    return announcement
+
+
+@app.post("/api/announcements/cycle", response_model=List[schemas.AnnouncementResponse], dependencies=[Depends(verify_token)])
+def create_announcement_cycle(data: schemas.AnnouncementCycleCreate, db: Session = Depends(get_db)):
+    """Цикл поездки: рейсы «туда» и «обратно» с общим водителем создаются одной транзакцией и связываются cycle_id."""
+    if (data.back.date, data.back.time) < (data.forward.date, data.forward.time):
+        raise HTTPException(status_code=400, detail="Обратный рейс не может быть раньше рейса «Туда»")
+    forward = models.Announcement(date=data.forward.date, time=data.forward.time, address=data.forward.address,
+                                  driver_id=data.driver_id, direction="forward", occupied_seats=0)
+    back = models.Announcement(date=data.back.date, time=data.back.time, address=data.back.address,
+                               driver_id=data.driver_id, direction="return", occupied_seats=0)
+    db.add_all([forward, back])
+    db.flush()                                   # получаем id
+    forward.cycle_id = back.cycle_id = forward.id
+    db.commit()
+    db.refresh(forward)
+    db.refresh(back)
+    return [forward, back]
+
+
+@app.delete("/api/announcements/{announcement_id}", dependencies=[Depends(verify_token)])
+def delete_announcement(announcement_id: int, with_cycle: bool = False, db: Session = Depends(get_db)):
+    """Удаляет рейс; с with_cycle=true — и парный рейс того же цикла. Уже созданные заявки не затрагиваются."""
+    announcement = db.query(models.Announcement).filter(models.Announcement.id == announcement_id).first()
+    if not announcement:
+        raise HTTPException(status_code=404, detail="Рейс не найден")
+    targets = [announcement]
+    if with_cycle and announcement.cycle_id:
+        targets = db.query(models.Announcement).filter(models.Announcement.cycle_id == announcement.cycle_id).all()
+    deleted = [a.id for a in targets]
+    for a in targets:
+        db.delete(a)
+    db.commit()
+    return {"deleted": deleted}
+
+
+# =====================================================================
+# ОТЗЫВЫ (раньше хранились в localStorage браузера посетителя)
+# =====================================================================
+@app.get("/api/reviews", response_model=List[schemas.ReviewResponse])
+def get_reviews(limit: int = Query(200, ge=1, le=500), db: Session = Depends(get_db)):
+    """Публичный список отзывов, новые сверху. Телефон и email наружу не отдаются."""
+    return db.query(models.Review).order_by(models.Review.id.desc()).limit(limit).all()
+
+
+@app.post("/api/reviews", response_model=schemas.ReviewResponse)
+@limiter.limit(REVIEW_RATE_LIMIT)
+def create_review(request: Request, data: schemas.ReviewCreate, db: Session = Depends(get_db)):
+    """Новый отзыв. Забаненные по номеру телефона пользователи отзывы оставлять не могут."""
+    if data.consent is not True:
+        raise HTTPException(status_code=400, detail="Необходимо согласие на обработку персональных данных")
+    user = db.query(models.User).filter(models.User.phone == data.phone).first()
+    if user and user.is_banned:
+        raise HTTPException(status_code=403, detail="Пользователь забанен. Оставить отзыв невозможно.")
+    review = models.Review(name=data.name, phone=data.phone, email=data.email, rating=data.rating, text=data.text)
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+
+@app.delete("/api/reviews/{review_id}", dependencies=[Depends(verify_token)])
+def delete_review(review_id: int, db: Session = Depends(get_db)):
+    review = db.query(models.Review).filter(models.Review.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="Отзыв не найден")
+    db.delete(review)
+    db.commit()
+    return {"deleted": review_id}
