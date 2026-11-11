@@ -1,22 +1,8 @@
+import datetime as _dt
 import re
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import date, datetime
 from typing import Optional, List, Literal
-
-
-# Схема для создания подписчика
-class SubscriberCreate(BaseModel):
-    email: EmailStr
-
-
-# Схема ответа для подписчика
-class SubscriberResponse(BaseModel):
-    id: int
-    email: str
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 # Схема для создания пользователя
@@ -125,6 +111,106 @@ class ExtraServiceResponse(BaseModel):
     service_date: date
     amount: int
     comment: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ---------- Анонсы рейсов ----------
+def _check_time(v: str) -> str:
+    v = (v or "").strip()
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", v):
+        raise ValueError("Время должно быть в формате ЧЧ:ММ (00:00–23:59)")
+    return v
+
+
+class AnnouncementCreate(BaseModel):
+    date: _dt.date
+    time: str
+    address: str = Field(min_length=1, max_length=500)
+    driver_id: Literal["1", "2"]
+    direction: Literal["forward", "return"] = "forward"
+    occupied_seats: int = Field(0, ge=0, le=8)
+    cycle_id: Optional[int] = None
+
+    @field_validator("time")
+    @classmethod
+    def validate_time(cls, v: str) -> str:
+        return _check_time(v)
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def strip_address(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+
+class AnnouncementLeg(BaseModel):
+    date: _dt.date
+    time: str
+    address: str = Field(min_length=1, max_length=500)
+
+    @field_validator("time")
+    @classmethod
+    def validate_time(cls, v: str) -> str:
+        return _check_time(v)
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def strip_address(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+
+class AnnouncementCycleCreate(BaseModel):
+    """Полный цикл: рейс «туда» и «обратно» с одним водителем."""
+    driver_id: Literal["1", "2"]
+    forward: AnnouncementLeg
+    back: AnnouncementLeg
+
+
+class AnnouncementResponse(BaseModel):
+    id: int
+    date: _dt.date
+    time: str
+    address: str
+    driver_id: str
+    direction: str
+    occupied_seats: int
+    cycle_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ---------- Отзывы ----------
+class ReviewCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    phone: str
+    email: EmailStr
+    rating: int = Field(ge=1, le=5)
+    text: str = Field(min_length=1, max_length=2000)
+    consent: Optional[bool] = None       # согласие на обработку персональных данных (152-ФЗ)
+
+    @field_validator("name", "text", mode="before")
+    @classmethod
+    def strip_text(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        digits = re.sub(r"\D", "", v or "")
+        if not 10 <= len(digits) <= 15:
+            raise ValueError("Некорректный номер телефона")
+        return v.strip()
+
+
+class ReviewResponse(BaseModel):
+    """Публичные поля отзыва: телефон и email наружу не отдаются."""
+    id: int
+    name: str
+    rating: int
+    text: str
     created_at: Optional[datetime] = None
 
     class Config:
