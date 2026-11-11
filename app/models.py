@@ -57,25 +57,31 @@ class BookingSegment(Base):
     seats = Column(Integer, nullable=False, default=1)
 
 
-# Таблица подписчиков
-class Subscriber(Base):
-    __tablename__ = "subscribers"
-
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(100), unique=True, nullable=False)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-# Таблица отзывов
+# Таблица отзывов (показываются на сайте; телефон и email — только для модерации и проверки бана)
 class Review(Base):
     __tablename__ = "reviews"
 
     id = Column(Integer, primary_key=True, index=True)
-    booking_id = Column(Integer, ForeignKey("bookings.id"))
-    rating = Column(Integer)
-    comment = Column(Text)
+    name = Column(String(100), nullable=False)
+    phone = Column(String(30), nullable=False)
+    email = Column(String(100), nullable=False)
+    rating = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# Анонсы рейсов (раньше хранились в localStorage браузера администратора)
+class Announcement(Base):
+    __tablename__ = "announcements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    time = Column(String(5), nullable=False)                        # "ЧЧ:ММ"
+    address = Column(String(500), nullable=False)
+    driver_id = Column(String(10), nullable=False)
+    direction = Column(String(10), nullable=False)                  # "forward" | "return"
+    occupied_seats = Column(Integer, nullable=False, default=0)
+    cycle_id = Column(Integer, nullable=True, index=True)           # связывает рейсы «туда» и «обратно» одного цикла
 
 
 # Дополнительные услуги: трансфер (аренда авто) и перевозка посылок
