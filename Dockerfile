@@ -30,4 +30,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8000'), timeout=4).status == 200 else 1)"
 
 # --proxy-headers: корректный IP клиента за прокси платформы
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
